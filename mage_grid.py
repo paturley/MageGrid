@@ -1,14 +1,27 @@
 """
-Mage Grid — Pygame implementation with event-based combat animation.
+Mage Grid — Sprite Edition.
 
-Board: 9 cols × 10 rows. frontier[c] = last row owned by TOP player.
-Rows 0..frontier[c] → top territory (dark brown, hollow units).
-Rows frontier[c]+1..9 → bottom territory (light brown, filled units).
+Same rules and combat engine as mage_grid.py, with pixel-art mage sprites:
 
-CombatPlan is computed once before animation starts and drives the
-AnimState machine. No board-snapping shortcuts.
+  * Units are element mages (water / fire / lightning / nature / earth),
+    white robes on the left army, black robes on the right.
+  * While a player is picking colors, their army idles with a 3-frame
+    bob / robe-swish loop plus ambient element effects.
+  * When an attack launches, each formation flashes, collapses and
+    transforms into a ball of its element, then marches across the field.
+  * Defense formations cast: staff flare, then an element force-field wall
+    rises along the formation's front edge — one segment per mage, so
+    two-color formations raise a striped wall.
+  * The first time an attack ball breaks against a field, the wall turns
+    weakened (dimmed, holed, fractured) and the spent mages bow over,
+    breathing hard, until the formation dissolves.
+
+Sprites are loaded from assets/sprites.png (regenerate with gen_sprites.py).
+
+Run:  python3 mage_grid_sprite.py
 """
 
+import os
 import pygame
 import sys
 import random
@@ -21,17 +34,17 @@ from typing import Optional
 # Layout constants
 # ---------------------------------------------------------------------------
 
-GRID_COLS = 9
-GRID_ROWS = 10
-STARTING_FRONTIER = 4          # rows 0-4 top, 5-9 bottom
+GRID_COLS = 10
+GRID_ROWS = 9
+STARTING_FRONTIER = 4          # cols 0-4 left, 5-9 right
 
 CELL = 62
 SIDEBAR_W = 230
 HUD_H = 72
-PLAYER_BAR_H = 28               # strip above/below grid for name + HP
+PLAYER_BAR_H = 28               # strip above grid, split left/right
 GRID_Y = HUD_H + PLAYER_BAR_H  # pixel y where the grid starts
 SCREEN_W = GRID_COLS * CELL + SIDEBAR_W
-SCREEN_H = GRID_Y + GRID_ROWS * CELL + PLAYER_BAR_H
+SCREEN_H = GRID_Y + GRID_ROWS * CELL
 FPS = 60
 
 # ---------------------------------------------------------------------------
@@ -44,162 +57,127 @@ NUM_COLORS  = 5
 HP_MAX      = 10
 
 UNIT_RGB = {
-    0: (90,  150, 255),   # Blue
-    1: (255,  60,  45),   # Red
-    2: (255, 225,  30),   # Yellow
-    3: ( 50, 195,  75),   # Green
-    4: (215, 215, 215),   # White
+    0: (90,  150, 255),   # Blue   — water
+    1: (255,  60,  45),   # Red    — fire
+    2: (255, 225,  30),   # Yellow — lightning
+    3: ( 50, 195,  75),   # Green  — nature
+    4: (215, 215, 215),   # White  — earth
 }
 
-BG_TOP       = (55,  32,  12)
-BG_BOTTOM    = (172, 133,  78)
+BG_LEFT      = (55,  32,  12)
+BG_RIGHT     = (172, 133,  78)
 BG_SIDEBAR   = (28,  22,  16)
 BG_HUD       = (18,  15,  10)
 C_GRID       = (0,   0,   0)
 C_FRONTIER   = (255, 255, 255)
-C_DEF_NORMAL = (255, 255, 255)   # defense outline before hit
-C_DEF_HIT    = (255,  40,  40)   # defense outline after hit
-
 
 # ---------------------------------------------------------------------------
-# Unit shapes
+# Sprite sheet
+# ---------------------------------------------------------------------------
+# sheet columns (24x24 tiles, one row per color index):
+#   0-2   left idle f0-f2        3-5   right idle f0-f2
+#   6-8   left cast c0-c2        9-11  right cast c0-c2
+#   12-13 left tired t0-t1       14-15 right tired t0-t1
+#   16-18 transform (left-facing; mirrored at load for the right army)
+#   19-21 force field (front on the right; mirrored for right defenders)
+#   22-24 weakened field (same facing rule)
+#   25-28 ball f0-f3 (mirrored for right attackers so rolling reads right)
 # ---------------------------------------------------------------------------
 
-def _surf(w, h):
-    s = pygame.Surface((w, h), pygame.SRCALPHA)
-    return s
+SHEET_TILE = 24
+SPRITE_PX  = 48                  # 2x integer scale, centered in the cell
+SPRITE_OFF = (CELL - SPRITE_PX) // 2
 
-def draw_unit(dest, color_idx, rect, filled, alpha=255, anim_t=0.0):
-    color = (*UNIT_RGB[color_idx], alpha)
-    fns = [_draw_droplet, _draw_flame, _draw_bolt, _draw_tree, _draw_rock]
-    fns[color_idx](dest, color, rect, filled, anim_t)
+IDLE_SEQ       = [0, 1, 2, 1]    # base, bob, swish, bob
+IDLE_FRAME_S   = 0.30
+BALL_FRAME_S   = 0.12
+CAST_FRAME_S   = 0.18
+TIRED_FRAME_S  = 0.35
+FIELD_FRAME_S  = 0.16
+TF_FRAME_S     = 0.18
+TRANSFORM_DUR  = 3 * TF_FRAME_S  # formation transforms before marching
 
-
-def _poly(s, color, pts, filled, lw=3):
-    pygame.draw.polygon(s, color, pts, 0 if filled else lw)
-
-
-def _draw_droplet(dest, color, rect, filled, anim_t=0.0):
-    """Smooth teardrop that bobs gently when animated."""
-    s = _surf(rect.w, rect.h)
-    cx, cy = rect.w // 2, rect.h // 2
-    r   = rect.w * 0.295
-    bob = math.sin(anim_t * 2.6) * rect.h * 0.07  # slow vertical bob
-    bcy = cy + rect.h * 0.09 + bob
-    tip = (cx, int(cy - rect.h * 0.42 + bob))
-
-    pts = []
-    for i in range(20):
-        a = math.radians(32 - i * (244 / 19))
-        pts.append((int(cx + r * math.cos(a)),
-                    int(bcy - r * math.sin(a))))
-    pts.append(tip)
-
-    _poly(s, color, pts, filled)
-    dest.blit(s, rect.topleft)
+SPRITES = {}                     # SPRITES[color]["idle"]["left"][frame] etc.
 
 
-def _draw_flame(dest, color, rect, filled, anim_t=0.0):
-    """Flame whose tips flicker at different rates for an organic fire look."""
-    s = _surf(rect.w, rect.h)
-    cx, cy = rect.w // 2, rect.h // 2
-    w, h = rect.w * 0.44, rect.h * 0.46
-    # Independent oscillators for each flame tongue
-    tip_sx  = math.sin(anim_t * 7.0) * w * 0.10   # main tip sways side
-    tip_sy  = math.sin(anim_t * 5.3) * h * 0.05   # main tip bobs
-    rt_sx   = math.sin(anim_t * 9.1 + 1.5) * w * 0.08   # right tongue
-    lt_sx   = math.sin(anim_t * 8.5 + 0.8) * w * 0.08   # left tongue (different phase)
-    pts = [
-        (cx + tip_sx,                        cy - h + tip_sy),       # main tip
-        (cx + w * 0.14,                      cy - h * 0.46),
-        (cx + w * 0.46 + rt_sx,              cy - h * 0.64),         # right tongue tip
-        (cx + w * 0.58,                      cy - h * 0.26),
-        (cx + w * 0.72,                      cy + h * 0.14),
-        (cx + w * 0.54,                      cy + h * 0.64),
-        (cx + w * 0.22,                      cy + h),                # base (stable)
-        (cx - w * 0.22,                      cy + h),
-        (cx - w * 0.54,                      cy + h * 0.64),
-        (cx - w * 0.72,                      cy + h * 0.14),
-        (cx - w * 0.58,                      cy - h * 0.26),
-        (cx - w * 0.46 + lt_sx,              cy - h * 0.64),         # left tongue tip
-        (cx - w * 0.14,                      cy - h * 0.46),
-    ]
-    pts = [(int(x), int(y)) for x, y in pts]
-    _poly(s, color, pts, filled)
-    dest.blit(s, rect.topleft)
+def load_sprites():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "assets", "sprites.png")
+    sheet = pygame.image.load(path).convert_alpha()
+
+    def tile(col, row, flip=False):
+        s = sheet.subsurface((col * SHEET_TILE, row * SHEET_TILE,
+                              SHEET_TILE, SHEET_TILE))
+        s = pygame.transform.scale(s, (SPRITE_PX, SPRITE_PX))
+        if flip:
+            s = pygame.transform.flip(s, True, False)
+        return s
+
+    for ci in range(NUM_COLORS):
+        SPRITES[ci] = {
+            "idle":  {"left":  [tile(c, ci) for c in range(0, 3)],
+                      "right": [tile(c, ci) for c in range(3, 6)]},
+            "cast":  {"left":  [tile(c, ci) for c in range(6, 9)],
+                      "right": [tile(c, ci) for c in range(9, 12)]},
+            "tired": {"left":  [tile(c, ci) for c in range(12, 14)],
+                      "right": [tile(c, ci) for c in range(14, 16)]},
+            "tf":    {"left":  [tile(c, ci) for c in range(16, 19)],
+                      "right": [tile(c, ci, True) for c in range(16, 19)]},
+            "fld":   {"left":  [tile(c, ci) for c in range(19, 22)],
+                      "right": [tile(c, ci, True) for c in range(19, 22)]},
+            "dmg":   {"left":  [tile(c, ci) for c in range(22, 25)],
+                      "right": [tile(c, ci, True) for c in range(22, 25)]},
+            "ball":  {"left":  [tile(c, ci) for c in range(25, 29)],
+                      "right": [tile(c, ci, True) for c in range(25, 29)]},
+        }
 
 
-def _draw_bolt(dest, color, rect, filled, anim_t=0.0):
-    """Lightning bolt that rapidly flickers its brightness."""
-    s = _surf(rect.w, rect.h)
-    cx, cy = rect.w // 2, rect.h // 2
-    w, h = rect.w * 0.22, rect.h * 0.40
-    # Flicker: brightness pulses fast with occasional near-off moments
-    flicker = 0.55 + 0.45 * abs(math.sin(anim_t * 14.0))
-    r, g, b, a = color
-    color = (r, g, b, int(a * flicker))
-    pts = [
-        (cx + w * 0.55,  cy - h),
-        (cx - w * 0.10,  cy - h * 0.05),
-        (cx + w * 0.65,  cy - h * 0.05),
-        (cx - w * 0.55,  cy + h),
-        (cx + w * 0.10,  cy + h * 0.05),
-        (cx - w * 0.65,  cy + h * 0.05),
-    ]
-    pts = [(int(x), int(y)) for x, y in pts]
-    _poly(s, color, pts, filled)
-    dest.blit(s, rect.topleft)
+def blit_sprite(dest, surf, x, y, alpha=255):
+    if alpha >= 255:
+        dest.blit(surf, (x, y))
+    elif alpha > 0:
+        tmp = surf.copy()
+        tmp.set_alpha(alpha)
+        dest.blit(tmp, (x, y))
 
 
-def _draw_tree(dest, color, rect, filled, anim_t=0.0):
-    """Pine tree that sways its canopy in a gentle breeze."""
-    s = _surf(rect.w, rect.h)
-    cx, cy = rect.w // 2, rect.h // 2
-    w, h = rect.w * 0.40, rect.h * 0.44
-    tw = max(3, int(rect.w * 0.12))
-    th = int(rect.h * 0.20)
-    sway     = math.sin(anim_t * 1.4) * w * 0.20   # tip sways most
-    sway_low = sway * 0.35                           # base of canopy sways less
-    canopy = [
-        (cx + sway,           int(cy - h)),
-        (int(cx + w + sway_low), int(cy + h * 0.30)),
-        (int(cx - w + sway_low), int(cy + h * 0.30)),
-    ]
-    tx = int(cx - tw // 2 + sway_low * 0.5)
-    ty = int(cy + h * 0.30)
-    if filled:
-        pygame.draw.polygon(s, color, canopy)
-        pygame.draw.rect(s, color, (tx, ty, tw, th))
+def idle_frame(anim_t):
+    return IDLE_SEQ[int(anim_t / IDLE_FRAME_S) % len(IDLE_SEQ)] if anim_t else 0
+
+
+def draw_mage(dest, color_idx, side, cell_x, cell_y, alpha=255, anim_t=0.0,
+              pose="idle", pose_frame=0):
+    """Draw a mage sprite whose cell's top-left pixel is (cell_x, cell_y)."""
+    if pose == "idle":
+        frame = idle_frame(anim_t)
     else:
-        pygame.draw.polygon(s, color, canopy, 3)
-        pygame.draw.rect(s, color, (tx, ty, tw, th), 2)
-    dest.blit(s, rect.topleft)
+        frame = pose_frame
+    surf = SPRITES[color_idx][pose][side][frame]
+    blit_sprite(dest, surf, cell_x + SPRITE_OFF, cell_y + SPRITE_OFF, alpha)
 
 
-def _draw_rock(dest, color, rect, filled, anim_t=0.0):
-    """Rounded boulder with a subtle breathing pulse."""
-    s = _surf(rect.w, rect.h)
-    cx, cy = rect.w // 2, rect.h // 2
-    w, h = rect.w * 0.42, rect.h * 0.40
-    sc = 1.0 + math.sin(anim_t * 0.9) * 0.035   # gentle scale pulse
-    raw = [
-        (cx + w * 0.20,  cy - h),
-        (cx + w * 0.75,  cy - h * 0.58),
-        (cx + w,         cy + h * 0.12),
-        (cx + w * 0.72,  cy + h * 0.75),
-        (cx + w * 0.15,  cy + h),
-        (cx - w * 0.38,  cy + h * 0.90),
-        (cx - w,         cy + h * 0.38),
-        (cx - w * 0.80,  cy - h * 0.32),
-        (cx - w * 0.35,  cy - h * 0.88),
-    ]
-    pts = [(int(cx + (x - cx) * sc), int(cy + (y - cy) * sc)) for x, y in raw]
-    _poly(s, color, pts, filled)
-    dest.blit(s, rect.topleft)
+def draw_ball(dest, color_idx, side, cell_x, cell_y, frame, alpha=255):
+    surf = SPRITES[color_idx]["ball"][side][frame % 4]
+    blit_sprite(dest, surf, cell_x + SPRITE_OFF, cell_y + SPRITE_OFF, alpha)
+
+
+def draw_field(dest, color_idx, def_side, cell_x, cell_y, frame,
+               damaged=False, alpha=255):
+    """Field band hugs the formation's front edge (enemy-facing)."""
+    bank = "dmg" if damaged else "fld"
+    surf = SPRITES[color_idx][bank][def_side][frame % 3]
+    # left defender faces right: align tile's right edge with the cell's;
+    # right defender (mirrored band) aligns with the cell's left edge.
+    x = cell_x + (CELL - SPRITE_PX if def_side == "left" else 0)
+    blit_sprite(dest, surf, x, cell_y + SPRITE_OFF, alpha)
 
 
 def cell_rect(r, c):
     return pygame.Rect(c * CELL, r * CELL + GRID_Y, CELL, CELL)
+
+
+def cell_xy(r, c):
+    return c * CELL, r * CELL + GRID_Y
 
 
 # ---------------------------------------------------------------------------
@@ -209,47 +187,47 @@ def cell_rect(r, c):
 @dataclass
 class BoardState:
     board: list      # board[r][c] = color index 0-4
-    frontier: list   # frontier[c] = last row owned by top player
-    hp_top: int = HP_MAX
-    hp_bottom: int = HP_MAX
+    frontier: list   # frontier[r] = last col owned by left player
+    hp_left: int = HP_MAX
+    hp_right: int = HP_MAX
 
     def copy(self):
         return BoardState(
             [row[:] for row in self.board],
             self.frontier[:],
-            self.hp_top,
-            self.hp_bottom,
+            self.hp_left,
+            self.hp_right,
         )
 
-    def owner_is_top(self, r, c):
-        return r <= self.frontier[c]
+    def owner_is_left(self, r, c):
+        return c <= self.frontier[r]
 
 
 def make_board():
     board = [[random.randrange(NUM_COLORS) for _ in range(GRID_COLS)]
              for _ in range(GRID_ROWS)]
-    return BoardState(board=board, frontier=[STARTING_FRONTIER] * GRID_COLS)
+    return BoardState(board=board, frontier=[STARTING_FRONTIER] * GRID_ROWS)
 
 
 # ---------------------------------------------------------------------------
 # Formation detection
 # ---------------------------------------------------------------------------
-# NOTE: rows[0] = FRONT soldier (closest to enemy frontier).
-#       rows[-1] = BACK soldier (furthest from enemy).
+# NOTE: cols[0] = FRONT soldier (closest to enemy frontier).
+#       cols[-1] = BACK soldier (furthest from enemy).
 # ---------------------------------------------------------------------------
 
 @dataclass
 class AttackFormation:
     formation_id: int
-    col: int
-    rows: list          # rows[0]=front, rows[-1]=back
+    row: int
+    cols: list          # cols[0]=front, cols[-1]=back
 
     @property
     def power(self):    # 3 soldiers → 1 kill, 4 → 2, etc.
-        return len(self.rows) - 2
+        return len(self.cols) - 2
 
-    def front_row(self):
-        return self.rows[0]
+    def front_col(self):
+        return self.cols[0]
 
 
 @dataclass
@@ -261,51 +239,51 @@ class DefenseFormation:
         return set(self.cells)
 
 
-def find_attack_formations(bs: BoardState, attacker_is_top: bool,
+def find_attack_formations(bs: BoardState, attacker_is_left: bool,
                            chosen: tuple) -> list:
-    """Vertical runs ≥3 in attacker territory, all colors in chosen."""
+    """Horizontal runs ≥3 in attacker territory, all colors in chosen."""
     out, fid = [], 0
-    for c in range(GRID_COLS):
-        lo, hi = (0, bs.frontier[c]) if attacker_is_top \
-                 else (bs.frontier[c]+1, GRID_ROWS-1)
+    for r in range(GRID_ROWS):
+        lo, hi = (0, bs.frontier[r]) if attacker_is_left \
+                 else (bs.frontier[r]+1, GRID_COLS-1)
         if lo > hi:
             continue
         run = []
-        for r in range(lo, hi+1):
+        for c in range(lo, hi+1):
             if bs.board[r][c] in chosen:
-                run.append(r)
+                run.append(c)
             else:
                 if len(run) >= 3:
-                    # rows[0]=front: for top attacker, front=highest row; reverse the low→high run
-                    ordered = list(reversed(run)) if attacker_is_top else run[:]
-                    out.append(AttackFormation(fid, c, ordered))
+                    # cols[0]=front: for left attacker front=rightmost col
+                    ordered = list(reversed(run)) if attacker_is_left else run[:]
+                    out.append(AttackFormation(fid, r, ordered))
                     fid += 1
                 run = []
         if len(run) >= 3:
-            ordered = list(reversed(run)) if attacker_is_top else run[:]
-            out.append(AttackFormation(fid, c, ordered))
+            ordered = list(reversed(run)) if attacker_is_left else run[:]
+            out.append(AttackFormation(fid, r, ordered))
             fid += 1
     return out
 
 
-def find_defense_formations(bs: BoardState, defender_is_top: bool,
+def find_defense_formations(bs: BoardState, defender_is_left: bool,
                             chosen: tuple) -> list:
-    """Horizontal runs ≥3 in defender territory, all colors in chosen."""
+    """Vertical runs ≥3 in defender territory, all colors in chosen."""
     out, fid = [], 0
-    for r in range(GRID_ROWS):
+    for c in range(GRID_COLS):
         run = []
-        for c in range(GRID_COLS):
-            ok = (bs.owner_is_top(r, c) == defender_is_top) and \
+        for r in range(GRID_ROWS):
+            ok = (bs.owner_is_left(r, c) == defender_is_left) and \
                  (bs.board[r][c] in chosen)
             if ok:
-                run.append(c)
+                run.append(r)
             else:
                 if len(run) >= 3:
-                    out.append(DefenseFormation(fid, [(r, cc) for cc in run]))
+                    out.append(DefenseFormation(fid, [(rr, c) for rr in run]))
                     fid += 1
                 run = []
         if len(run) >= 3:
-            out.append(DefenseFormation(fid, [(r, cc) for cc in run]))
+            out.append(DefenseFormation(fid, [(rr, c) for rr in run]))
             fid += 1
     return out
 
@@ -316,58 +294,47 @@ def find_defense_formations(bs: BoardState, defender_is_top: bool,
 
 @dataclass
 class FmtAnimInfo:
-    """Per-formation animation data, built during combat plan construction."""
     fmt_idx: int
-    col: int
-    initial_rows: list      # rows[0]=front
-    attacker_is_top: bool
-    frontier_at_start: int  # frontier[col] when this formation begins
+    row: int
+    initial_cols: list       # cols[0]=front
+    attacker_is_left: bool
+    frontier_at_start: int   # frontier[row] when this formation begins
     kills: int
-    killed_def_rows: list   # defender rows killed, in order
-    blocked_by: Optional[int]   # defense formation id, or None
+    killed_def_cols: list    # defender cols killed, in order
+    blocked_by: Optional[int]
     breakthrough: bool
+    # vert_captures[k] = list of (r, c) triangle tiles captured up/down as the
+    # (k+1)-th forward soldier advances. Aligned with kill_px / killed_def_cols.
+    vert_captures: list = field(default_factory=list)
 
-    # Derived pixel thresholds (set in __post_init__)
     frontier_cross_px: float = field(init=False)
-    kill_px: list = field(init=False)      # kill_px[k] = px when kill k triggers
+    kill_px: list = field(init=False)
     end_px: float = field(init=False)
 
     def __post_init__(self):
-        front = self.initial_rows[0]
+        front = self.initial_cols[0]
         f = self.frontier_at_start
-        if self.attacker_is_top:
-            # front soldier is at row `front`, frontier boundary below row f
-            # distance in cells = f - front + 1  (always ≥1 since front ≤ f)
+        if self.attacker_is_left:
             cells_to_frontier = f - front + 1
         else:
-            # front soldier at row `front`, frontier boundary above row f+1
-            # distance in cells = front - (f+1) + 1 = front - f
             cells_to_frontier = front - f
         self.frontier_cross_px = cells_to_frontier * CELL
 
-        # After the front-2 dissolve at the frontier, the next remaining soldier
-        # is 2 cells behind the first defender.  Each subsequent kill also leaves
-        # the next soldier 2 cells from the new defender.  Hence each event is
-        # spaced 2*CELL apart, starting at frontier_cross_px + 2*CELL.
         self.kill_px = [self.frontier_cross_px + 2*(k+1)*CELL
                         for k in range(self.kills)]
 
-        power = len(self.initial_rows) - 2
-        has_remaining_soldiers = self.kills < power   # some soldiers still alive after all kills
+        power = len(self.initial_cols) - 2
+        has_remaining_soldiers = self.kills < power
 
         if self.blocked_by is not None or (self.breakthrough and has_remaining_soldiers):
-            # Remaining soldiers slide 2 more cells to reach the defense / edge.
             self.end_px = self.frontier_cross_px + 2*(self.kills+1)*CELL
         elif self.kills > 0:
-            # All soldiers consumed by kills (or breakthrough triggered on the
-            # last kill): animation ends when the last kill fires.
             self.end_px = self.kill_px[-1]
         else:
             self.end_px = self.frontier_cross_px
 
     def soldiers_at(self, slide_px: float) -> int:
-        """How many soldiers are still present at this slide offset."""
-        n = len(self.initial_rows)
+        n = len(self.initial_cols)
         if slide_px >= self.end_px and \
                 (self.blocked_by is not None or self.breakthrough or self.kills == n-2):
             return 0
@@ -380,8 +347,7 @@ class FmtAnimInfo:
         return max(0, n - removed)
 
     def defender_kills_at(self, slide_px: float) -> list:
-        """Defender rows killed so far at this slide offset."""
-        return [row for px, row in zip(self.kill_px, self.killed_def_rows)
+        return [col for px, col in zip(self.kill_px, self.killed_def_cols)
                 if slide_px >= px]
 
 
@@ -391,14 +357,14 @@ class FmtAnimInfo:
 
 @dataclass
 class CombatPlan:
-    attacker_is_top: bool
-    # sorted execution order: left→right, front-to-back within column
+    attacker_is_left: bool
+    # sorted execution order: top→bottom row, front-to-back within row
     attack_formations: list
     defense_formations: list
     defense_map: dict           # fid → DefenseFormation
     fmt_anim: list              # FmtAnimInfo per formation (same order)
     hit_def_ids: set
-    breakthrough_cols: list
+    breakthrough_rows: list
     # Final board after all combat
     final_board: BoardState
     # Non-formation attacker cells (phase 1 fade-out, phase 5 fade-back-in)
@@ -409,264 +375,291 @@ class CombatPlan:
     # Spawn cells (phase 8 fade-in), taken from final_board
     atk_spawn_cells: list
     def_spawn_cells: list
+    # Attacker cells overrun by a defender reclaim triangle (killed in RECLAIM)
+    reclaimed_cells: set
 
 
 # ---------------------------------------------------------------------------
 # Combat plan builder
 # ---------------------------------------------------------------------------
 
-def build_combat_plan(bs: BoardState, attacker_is_top: bool,
+def build_combat_plan(bs: BoardState, attacker_is_left: bool,
                       atk_colors: tuple, def_colors: tuple) -> CombatPlan:
-    """
-    Fully simulate combat on a copy of bs. Record every event needed to
-    drive animation. Never modify bs.
-    """
-    defender_is_top = not attacker_is_top
-    orig = bs.copy()   # reference snapshot; never modify
+    defender_is_left = not attacker_is_left
+    orig = bs.copy()
 
-    atk_fmts = find_attack_formations(orig, attacker_is_top, atk_colors)
-    def_fmts  = find_defense_formations(orig, defender_is_top, def_colors)
+    atk_fmts = find_attack_formations(orig, attacker_is_left, atk_colors)
+    def_fmts  = find_defense_formations(orig, defender_is_left, def_colors)
     def_map   = {f.formation_id: f for f in def_fmts}
 
-    # Cell → defense formation id (for fast lookup during simulation)
     cell_to_dfid: dict = {}
     for df in def_fmts:
         for cell in df.cells:
             cell_to_dfid[cell] = df.formation_id
 
-    # Sort attack formations: left→right column, then front row closest to enemy first
-    # (for top attacker, front = highest row → smallest distance to frontier → largest row
-    #  so sort by row descending within column; for bottom, sort by row ascending)
     def sort_key(af: AttackFormation):
-        front = af.rows[0]
-        return (af.col, -front if attacker_is_top else front)
+        front = af.cols[0]
+        return (af.row, -front if attacker_is_left else front)
 
     atk_fmts_sorted = sorted(atk_fmts, key=sort_key)
 
-    # Non-formation attacker cells
     fmt_cell_set: set = set()
     for af in atk_fmts_sorted:
-        for r in af.rows:
-            fmt_cell_set.add((r, af.col))
+        for c in af.cols:
+            fmt_cell_set.add((af.row, c))
 
-    if attacker_is_top:
+    if attacker_is_left:
         non_fmt_atk = [(r, c) for r in range(GRID_ROWS) for c in range(GRID_COLS)
-                       if orig.owner_is_top(r, c) and (r, c) not in fmt_cell_set]
+                       if orig.owner_is_left(r, c) and (r, c) not in fmt_cell_set]
     else:
         non_fmt_atk = [(r, c) for r in range(GRID_ROWS) for c in range(GRID_COLS)
-                       if not orig.owner_is_top(r, c) and (r, c) not in fmt_cell_set]
+                       if not orig.owner_is_left(r, c) and (r, c) not in fmt_cell_set]
 
-    # Simulate combat; track frontier per column.
-    # Reclaims from breakthroughs are DEFERRED until every formation in the
-    # same column has finished.  This means a back formation sees the frontier
-    # at the back-line set by the front formation, so it also breaks through
-    # automatically (no defenders left), earning an additional damage point.
     sim_frontier = orig.frontier[:]
     hit_def_ids: set = set()
-    breakthrough_cols: list = []
+    breakthrough_rows: list = []
     fmt_anim_list: list = []
-    col_breakthrough_count: dict = {}   # col → breakthroughs, reclaim deferred
+    row_breakthrough_count: dict = {}
 
-    # All attacker formation cells are consumed (removed from board)
     atk_removed: set = set(fmt_cell_set)
-    # Defender cells removed: killed individually + all cells in hit defense formations
     def_removed: set = set()
 
     for idx, af in enumerate(atk_fmts_sorted):
-        c = af.col
-        frontier_at_start = sim_frontier[c]
-        remaining_power   = af.power
-        killed_def_rows: list = []
+        r = af.row
+        power             = af.power
+        frontier_at_start = sim_frontier[r]
+        f0                = frontier_at_start
+        remaining_power   = power
+        killed_def_cols: list = []
         blocked_by: Optional[int] = None
         breakthrough = False
 
+        # --- Main row: forward march, one kill per soldier (captures col f+k) ---
         while remaining_power > 0:
-            if attacker_is_top:
-                next_def_row = sim_frontier[c] + 1
-                past_edge    = next_def_row >= GRID_ROWS
+            if attacker_is_left:
+                next_def_col = sim_frontier[r] + 1
+                past_edge    = next_def_col >= GRID_COLS
             else:
-                next_def_row = sim_frontier[c]
-                past_edge    = next_def_row < 0
+                next_def_col = sim_frontier[r]
+                past_edge    = next_def_col < 0
 
             if past_edge:
                 breakthrough = True
                 break
 
-            cell = (next_def_row, c)
+            cell = (r, next_def_col)
             if cell in cell_to_dfid:
                 did = cell_to_dfid[cell]
                 hit_def_ids.add(did)
                 blocked_by = did
                 break
             else:
-                killed_def_rows.append(next_def_row)
+                killed_def_cols.append(next_def_col)
                 def_removed.add(cell)
-                sim_frontier[c] += 1 if attacker_is_top else -1
+                sim_frontier[r] += 1 if attacker_is_left else -1
                 remaining_power -= 1
 
+        kills = len(killed_def_cols)
+
+        # --- Triangle: each forward soldier also captures up/down tiles, so the
+        #     captured region tapers from a wide base (col f+1) to a point. Row
+        #     r+s reaches forward (power-|s|) cols, capped by the kills actually
+        #     made (tip truncated if blocked). Stops before defense formations
+        #     and the board edge; off-board / already-owned tiles are skipped.
+        vert_captures: list = [[] for _ in range(kills)]
+        if not breakthrough and kills > 0:
+            for s in range(-(power - 1), power):
+                if s == 0:
+                    continue                      # main row handled above
+                rr = r + s
+                if not (0 <= rr < GRID_ROWS):
+                    continue
+                ext = min(power - abs(s), kills)
+                if ext <= 0:
+                    continue
+                cur = sim_frontier[rr]
+                for _ in range(ext):
+                    if attacker_is_left:
+                        ncol = cur + 1
+                        if ncol >= GRID_COLS:
+                            break
+                    else:
+                        ncol = cur
+                        if ncol < 0:
+                            break
+                    vcell = (rr, ncol)
+                    if vcell in cell_to_dfid:      # defense formation blocks
+                        break
+                    # animation step: outer/farther-forward tiles fall later
+                    m = abs(ncol - f0)
+                    k = min(kills - 1, max(0, m + abs(s) - 1))
+                    vert_captures[k].append(vcell)
+                    def_removed.add(vcell)
+                    cur = ncol if attacker_is_left else ncol - 1
+                sim_frontier[rr] = cur
+
         if breakthrough:
-            # Count but do NOT reclaim yet — leave frontier at back line so
-            # subsequent formations in this column also break through.
-            col_breakthrough_count[c] = col_breakthrough_count.get(c, 0) + 1
+            row_breakthrough_count[r] = row_breakthrough_count.get(r, 0) + 1
 
         fmt_anim_list.append(FmtAnimInfo(
-            fmt_idx=idx, col=c,
-            initial_rows=af.rows[:],
-            attacker_is_top=attacker_is_top,
+            fmt_idx=idx, row=r,
+            initial_cols=af.cols[:],
+            attacker_is_left=attacker_is_left,
             frontier_at_start=frontier_at_start,
-            kills=len(killed_def_rows),
-            killed_def_rows=killed_def_rows,
+            kills=kills,
+            killed_def_cols=killed_def_cols,
             blocked_by=blocked_by,
             breakthrough=breakthrough,
+            vert_captures=vert_captures,
         ))
 
-    # Apply all deferred reclaims now that every formation has processed.
-    # Each breakthrough costs the defender 3 squares and 1 HP.
-    for c, count in col_breakthrough_count.items():
+    # --- Breakthrough reclaim: the defender re-takes a triangle of tiles
+    #     centered on the hit row. Each row is brought UP TO a target depth
+    #     (3 tiles in the hit row, 2 in rows ±1, 1 in rows ±2) — i.e. the
+    #     defender ends up owning max(target, what it already owns) tiles in
+    #     that row. Rows it already holds deeply are left untouched. ---
+    RECLAIM_TRIANGLE = ((0, 3), (1, 2), (-1, 2), (2, 1), (-2, 1))
+    for r, count in row_breakthrough_count.items():
         for _ in range(count):
-            breakthrough_cols.append(c)
-            if attacker_is_top:
-                sim_frontier[c] = max(sim_frontier[c] - 3, -1)
-            else:
-                sim_frontier[c] = min(sim_frontier[c] + 3, GRID_ROWS - 1)
+            breakthrough_rows.append(r)
+            for ds, target in RECLAIM_TRIANGLE:
+                rr = r + ds
+                if not (0 <= rr < GRID_ROWS):
+                    continue
+                if attacker_is_left:
+                    # defender = right, owns cols frontier+1..9; owning `target`
+                    # tiles means frontier at GRID_COLS-1-target. Only move it
+                    # back (max-with-current), never forward.
+                    sim_frontier[rr] = min(sim_frontier[rr],
+                                           GRID_COLS - 1 - target)
+                else:
+                    # defender = left, owns cols 0..frontier; owning `target`
+                    # tiles means frontier at target-1.
+                    sim_frontier[rr] = max(sim_frontier[rr], target - 1)
 
-    # Add all cells in hit defense formations to def_removed
     for did in hit_def_ids:
         for cell in def_map[did].cells:
             def_removed.add(cell)
 
-    # Cells in reclaimed zones (were attacker territory, now defender territory)
-    # must be treated as forced defender spawns, not surviving attackers.
+    # Cells that flipped from attacker back to defender (reclaim triangle).
     reclaimed_cells: set = set()
-    for c in breakthrough_cols:
-        orig_f = orig.frontier[c]
-        new_f  = sim_frontier[c]
-        if attacker_is_top:
-            # top attacked; defender reclaimed rows new_f+1..orig_f
-            # (orig_f is where frontier was before formation started in this col;
-            #  but the breakthrough may have consumed all defenders, then reclaimed back)
-            # rows now in bottom territory that were originally top territory:
-            for r in range(new_f + 1, orig_f + 1):
+    for r in range(GRID_ROWS):
+        orig_f = orig.frontier[r]
+        new_f  = sim_frontier[r]
+        if attacker_is_left:
+            for c in range(new_f + 1, orig_f + 1):
                 reclaimed_cells.add((r, c))
         else:
-            # bottom attacked; defender reclaimed rows orig_f+1..new_f
-            for r in range(orig_f + 1, new_f + 1):
+            for c in range(orig_f + 1, new_f + 1):
                 reclaimed_cells.add((r, c))
+    # Attacker units standing on reclaimed tiles are overrun.
+    atk_removed |= reclaimed_cells
 
-    # Build final board
     final = orig.copy()
     final.frontier = sim_frontier[:]
-    if attacker_is_top:
-        final.hp_bottom -= len(breakthrough_cols)
+    if attacker_is_left:
+        final.hp_right -= len(breakthrough_rows)
     else:
-        final.hp_top -= len(breakthrough_cols)
+        final.hp_left -= len(breakthrough_rows)
 
-    # --- Attacker gravity ---
+    # Rows whose ownership shifted (captures advanced or reclaim retreated it).
+    changed_rows = set(r for r in range(GRID_ROWS)
+                       if sim_frontier[r] != orig.frontier[r])
+
+    # --- Attacker gravity (per row) ---
     atk_slide_map: dict = {}
     atk_spawn_cells: list = []
-    affected_atk_cols = set(af.col for af in atk_fmts_sorted)
+    affected_atk_rows = set(af.row for af in atk_fmts_sorted) | changed_rows
 
-    for c in affected_atk_cols:
-        f = sim_frontier[c]
+    for r in affected_atk_rows:
+        f = sim_frontier[r]
 
-        # Search the ORIGINAL attacker territory for survivors, not the new
-        # territory.  This captures non-formation units sitting in the reclaimed
-        # zone — they get pushed backward to the front of the new territory
-        # rather than disappearing.
-        if attacker_is_top:
-            orig_atk_rows = list(range(0, orig.frontier[c] + 1))
+        if attacker_is_left:
+            orig_atk_cols = list(range(0, orig.frontier[r] + 1))
             new_territory  = list(range(0, f + 1))
         else:
-            orig_atk_rows = list(range(orig.frontier[c] + 1, GRID_ROWS))
-            new_territory  = list(range(f + 1, GRID_ROWS))
+            orig_atk_cols = list(range(orig.frontier[r] + 1, GRID_COLS))
+            new_territory  = list(range(f + 1, GRID_COLS))
 
-        survivors = [r for r in orig_atk_rows
+        survivors = [c for c in orig_atk_cols
                      if (r, c) not in atk_removed
                      and (r, c) not in def_removed]
-        # reclaimed_cells exclusion removed: those units slide back to the front.
 
-        # Clamp in case heavy reclaiming leaves fewer slots than survivors.
         n = min(len(survivors), len(new_territory))
-        survivors = survivors[-n:] if attacker_is_top else survivors[:n]
+        survivors = survivors[-n:] if attacker_is_left else survivors[:n]
 
-        if attacker_is_top:
-            # Fill slots closest to the frontier first (highest rows).
-            # The survivor with the highest original row → highest new row.
+        if attacker_is_left:
             new_pos = new_territory[-n:]
-            for old_r, new_r in zip(reversed(survivors), reversed(new_pos)):
-                atk_slide_map[(old_r, c)] = (new_r, c)
-                final.board[new_r][c] = orig.board[old_r][c]
-            for r in new_territory[:-n] if n else new_territory:
+            for old_c, new_c in zip(reversed(survivors), reversed(new_pos)):
+                atk_slide_map[(r, old_c)] = (r, new_c)
+                final.board[r][new_c] = orig.board[r][old_c]
+            for c in (new_territory[:-n] if n else new_territory):
                 final.board[r][c] = random.randrange(NUM_COLORS)
                 atk_spawn_cells.append((r, c))
         else:
             new_pos = new_territory[:n]
-            for old_r, new_r in zip(survivors, new_pos):
-                atk_slide_map[(old_r, c)] = (new_r, c)
-                final.board[new_r][c] = orig.board[old_r][c]
-            for r in new_territory[n:]:
+            for old_c, new_c in zip(survivors, new_pos):
+                atk_slide_map[(r, old_c)] = (r, new_c)
+                final.board[r][new_c] = orig.board[r][old_c]
+            for c in new_territory[n:]:
                 final.board[r][c] = random.randrange(NUM_COLORS)
                 atk_spawn_cells.append((r, c))
 
-    # --- Defender gravity ---
+    # --- Defender gravity (per row) ---
     def_slide_map: dict = {}
     def_spawn_cells: list = []
-    affected_def_cols = set(c for (r, c) in def_removed) | \
-                        set(c for (r, c) in reclaimed_cells)
+    affected_def_rows = set(r for (r, c) in def_removed) | \
+                        set(r for (r, c) in reclaimed_cells) | changed_rows
 
-    for c in affected_def_cols:
-        f = sim_frontier[c]
-        if defender_is_top:
+    for r in affected_def_rows:
+        f = sim_frontier[r]
+        if defender_is_left:
             region = list(range(0, f + 1))
+            orig_def_region = list(range(0, orig.frontier[r] + 1))
         else:
-            region = list(range(f + 1, GRID_ROWS))
+            region = list(range(f + 1, GRID_COLS))
+            orig_def_region = list(range(orig.frontier[r] + 1, GRID_COLS))
 
-        # Survivors: originally in defender territory, not removed
-        if defender_is_top:
-            orig_def_region = list(range(0, orig.frontier[c] + 1))
-        else:
-            orig_def_region = list(range(orig.frontier[c] + 1, GRID_ROWS))
+        survivors = [c for c in orig_def_region
+                     if (r, c) not in def_removed and c in region]
 
-        survivors = [r for r in orig_def_region
-                     if (r, c) not in def_removed and r in region]
-
-        if defender_is_top:
+        if defender_is_left:
             new_pos = list(range(f - len(survivors) + 1, f + 1))
-            for old_r, new_r in zip(reversed(survivors), reversed(new_pos)):
-                def_slide_map[(old_r, c)] = (new_r, c)
-                final.board[new_r][c] = orig.board[old_r][c]
-            for r in range(0, f - len(survivors) + 1):
+            for old_c, new_c in zip(reversed(survivors), reversed(new_pos)):
+                def_slide_map[(r, old_c)] = (r, new_c)
+                final.board[r][new_c] = orig.board[r][old_c]
+            for c in range(0, f - len(survivors) + 1):
                 final.board[r][c] = random.randrange(NUM_COLORS)
                 def_spawn_cells.append((r, c))
         else:
             new_pos = list(range(f + 1, f + 1 + len(survivors)))
-            for old_r, new_r in zip(survivors, new_pos):
-                def_slide_map[(old_r, c)] = (new_r, c)
-                final.board[new_r][c] = orig.board[old_r][c]
-            for r in range(f + 1 + len(survivors), GRID_ROWS):
+            for old_c, new_c in zip(survivors, new_pos):
+                def_slide_map[(r, old_c)] = (r, new_c)
+                final.board[r][new_c] = orig.board[r][old_c]
+            for c in range(f + 1 + len(survivors), GRID_COLS):
                 final.board[r][c] = random.randrange(NUM_COLORS)
                 def_spawn_cells.append((r, c))
 
-    # Reclaimed cells → defender spawns (override anything written above in that slot)
     for (r, c) in reclaimed_cells:
         final.board[r][c] = random.randrange(NUM_COLORS)
         if (r, c) not in def_spawn_cells:
             def_spawn_cells.append((r, c))
 
     return CombatPlan(
-        attacker_is_top=attacker_is_top,
+        attacker_is_left=attacker_is_left,
         attack_formations=atk_fmts_sorted,
         defense_formations=def_fmts,
         defense_map=def_map,
         fmt_anim=fmt_anim_list,
         hit_def_ids=hit_def_ids,
-        breakthrough_cols=breakthrough_cols,
+        breakthrough_rows=breakthrough_rows,
         final_board=final,
         non_fmt_atk_cells=non_fmt_atk,
         atk_slide_map=atk_slide_map,
         def_slide_map=def_slide_map,
         atk_spawn_cells=atk_spawn_cells,
         def_spawn_cells=def_spawn_cells,
+        reclaimed_cells=reclaimed_cells,
     )
 
 
@@ -675,17 +668,11 @@ def build_combat_plan(bs: BoardState, attacker_is_top: bool,
 # ---------------------------------------------------------------------------
 
 class Phase(Enum):
-    # 1+2: non-fmt attackers fade out; defense outlines fade in
     FADE_SETUP    = auto()
-    # 3: process formation slides sequentially
     FMT_SLIDE     = auto()
-    # 4+5: hit formations disappear; unhit outlines fade; non-fmt fade back
     CLEANUP       = auto()
-    # 6: breakthrough reclaim frontier sweep
     RECLAIM       = auto()
-    # 7: gap-fill slides (atk + def simultaneously)
     SLIDE_FILL    = auto()
-    # 8: new units fade in
     SPAWN         = auto()
     DONE          = auto()
 
@@ -701,102 +688,89 @@ DUR_SPAWN       = 0.8
 class AnimState:
     def __init__(self, plan: CombatPlan, orig_board: BoardState):
         self.plan  = plan
-        self.orig  = orig_board   # immutable reference; never modified
+        self.orig  = orig_board
         self.phase = Phase.FADE_SETUP
-        self.t     = 0.0    # time within current phase
+        self.t     = 0.0
 
-        # Cells that have been visually killed (not drawn)
         self.dead: set = set()
-        # Cumulative elapsed time — used to timestamp deaths for burst animation
         self.total_t: float = 0.0
-        # (r,c) -> total_t when the cell was killed, for death-burst duration
+        # (r,c) -> (total_t, death_cx) — x position where the unit died
         self.dying: dict = {}
-        # Frontier as currently displayed
         self.vis_frontier: list = orig_board.frontier[:]
-        # Per-column kills so far (used to keep vis_frontier in sync)
-        self._col_kills_done = [0] * GRID_COLS
 
-        # Phase 1/5 alpha for non-fmt attackers (255=visible, 0=gone)
         self.non_fmt_alpha: float = 255.0
-        # Defense outline alpha
         self.def_outline_alpha: float = 0.0
-        # Which defense formation outlines are red (hit confirmed)
         self.red_def_ids: set = set()
 
-        # Phase 3: current formation being animated
         self.cur_fmt_idx: int = 0
         self.cur_slide_px: float = 0.0
+        self.fmt_tf_t: float = 0.0     # transform timer for current formation
 
-        # Phase 7
         self.slide_progress: float = 0.0
-        # Phase 8
         self.spawn_alpha: float = 0.0
-        # Red flash for breakthrough
         self.flash_alpha: float = 0.0
-        # Snapshot of vis_frontier at reclaim start (set in _end_cleanup)
         self._reclaim_start_frontier: list = []
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    def kill_cell(self, r, c, death_cy=None):
-        """Add (r,c) to dead set and timestamp it for the burst animation.
-
-        death_cy: screen-pixel y of the cell's centre at the moment it dies.
-        Defaults to the cell's stationary grid position.
-        """
+    def kill_cell(self, r, c, death_cx=None):
         self.dead.add((r, c))
         if (r, c) not in self.dying:
-            if death_cy is None:
-                death_cy = r * CELL + GRID_Y + CELL // 2
-            self.dying[(r, c)] = (self.total_t, death_cy)
+            if death_cx is None:
+                death_cx = c * CELL + CELL // 2
+            self.dying[(r, c)] = (self.total_t, death_cx)
 
-    def _advance_frontier(self, c, kills_delta):
-        """Update vis_frontier[c] by kills_delta kills toward enemy."""
-        plan = self.plan
-        if plan.attacker_is_top:
-            self.vis_frontier[c] += kills_delta
+    def _advance_frontier(self, r, kills_delta):
+        if self.plan.attacker_is_left:
+            self.vis_frontier[r] += kills_delta
         else:
-            self.vis_frontier[c] -= kills_delta
+            self.vis_frontier[r] -= kills_delta
+
+    def _set_capture_frontier(self, r, captured_col):
+        """Extend a row's visible frontier to include a just-captured tile."""
+        if self.plan.attacker_is_left:
+            self.vis_frontier[r] = max(self.vis_frontier[r], captured_col)
+        else:
+            self.vis_frontier[r] = min(self.vis_frontier[r], captured_col - 1)
 
     def _trigger_fmt_events(self, fai: FmtAnimInfo, old_px: float, new_px: float):
-        """Apply events that occur in the interval (old_px, new_px]."""
-        c   = fai.col
-        d   = 1 if fai.attacker_is_top else -1   # slide direction in screen y
+        r = fai.row
+        d = 1 if fai.attacker_is_left else -1
 
-        def _slid_cy(r, slide_px):
-            """Screen-pixel y-centre of formation soldier at row r with slide offset."""
-            return int(r * CELL + GRID_Y + int(slide_px * d) + CELL // 2)
+        def _slid_cx(c, slide_px):
+            return int(c * CELL + int(slide_px * d) + CELL // 2)
 
-        # Frontier cross — front 2 soldiers vanish at the frontier line
         if old_px < fai.frontier_cross_px <= new_px:
-            for r in fai.initial_rows[:2]:
-                self.kill_cell(r, c, _slid_cy(r, fai.frontier_cross_px))
+            for c in fai.initial_cols[:2]:
+                self.kill_cell(r, c, _slid_cx(c, fai.frontier_cross_px))
 
-        # Individual kills — one attacker + one stationary defender disappear
-        for k, (px, def_row) in enumerate(zip(fai.kill_px, fai.killed_def_rows)):
+        for k, (px, def_col) in enumerate(zip(fai.kill_px, fai.killed_def_cols)):
             if old_px < px <= new_px:
                 soldier_idx = 2 + k
-                if soldier_idx < len(fai.initial_rows):
-                    atk_r = fai.initial_rows[soldier_idx]
-                    self.kill_cell(atk_r, c, _slid_cy(atk_r, px))
-                # Defender was stationary — default position is correct
-                self.kill_cell(def_row, c)
-                self._advance_frontier(c, 1)
+                if soldier_idx < len(fai.initial_cols):
+                    atk_c = fai.initial_cols[soldier_idx]
+                    self.kill_cell(r, atk_c, _slid_cx(atk_c, px))
+                self.kill_cell(r, def_col)
+                self._advance_frontier(r, 1)
+                # This soldier also sweeps the triangle's up/down tiles.
+                if k < len(fai.vert_captures):
+                    for (vr, vc) in fai.vert_captures[k]:
+                        self.kill_cell(vr, vc)
+                        self._set_capture_frontier(vr, vc)
 
-        # Block — remaining formation soldiers vanish at the defense wall
         if fai.blocked_by is not None:
             if old_px < fai.end_px <= new_px:
-                for r in fai.initial_rows:
-                    self.kill_cell(r, c, _slid_cy(r, fai.end_px))
+                for c in fai.initial_cols:
+                    self.kill_cell(r, c, _slid_cx(c, fai.end_px))
+                # first hit: the wall turns weakened, its mages spent
                 self.red_def_ids.add(fai.blocked_by)
 
-        # Breakthrough — remaining soldiers slide off the back edge
         if fai.breakthrough:
             if old_px < fai.end_px <= new_px:
-                for r in fai.initial_rows:
-                    self.kill_cell(r, c, _slid_cy(r, fai.end_px))
+                for c in fai.initial_cols:
+                    self.kill_cell(r, c, _slid_cx(c, fai.end_px))
                 self.flash_alpha = 220.0
 
 
@@ -805,7 +779,6 @@ class AnimState:
 # ---------------------------------------------------------------------------
 
 def advance_anim(state: AnimState, dt: float) -> bool:
-    """Step animation by dt seconds. Returns True when complete."""
     plan = state.plan
     state.total_t += dt
 
@@ -838,11 +811,11 @@ def advance_anim(state: AnimState, dt: float) -> bool:
     elif state.phase == Phase.RECLAIM:
         state.t += dt
         p = min(state.t / DUR_RECLAIM, 1.0)
-        # Linear interpolation from snapshot taken in _end_cleanup to final frontier
-        for c in plan.breakthrough_cols:
-            start_f = state._reclaim_start_frontier[c]
-            final_f = plan.final_board.frontier[c]
-            state.vis_frontier[c] = int(round(start_f + (final_f - start_f) * p))
+        for r in range(GRID_ROWS):
+            start_f = state._reclaim_start_frontier[r]
+            final_f = plan.final_board.frontier[r]
+            if start_f != final_f:
+                state.vis_frontier[r] = int(round(start_f + (final_f - start_f) * p))
         if p >= 1.0:
             state.vis_frontier = plan.final_board.frontier[:]
             _start_slide_fill(state)
@@ -867,6 +840,7 @@ def _start_fmt_slide(state: AnimState):
     state.t = 0.0
     state.cur_fmt_idx = 0
     state.cur_slide_px = 0.0
+    state.fmt_tf_t = 0.0
     if not state.plan.attack_formations:
         _start_cleanup(state)
 
@@ -875,6 +849,11 @@ def _update_fmt_slide(state: AnimState, dt: float):
     plan = state.plan
     if state.cur_fmt_idx >= len(plan.attack_formations):
         _start_cleanup(state)
+        return
+
+    # the formation transforms into element balls before it marches
+    if state.fmt_tf_t < TRANSFORM_DUR:
+        state.fmt_tf_t += dt
         return
 
     fai = plan.fmt_anim[state.cur_fmt_idx]
@@ -886,6 +865,7 @@ def _update_fmt_slide(state: AnimState, dt: float):
     if new_px >= fai.end_px:
         state.cur_fmt_idx += 1
         state.cur_slide_px = 0.0
+        state.fmt_tf_t = 0.0
         if state.cur_fmt_idx >= len(plan.attack_formations):
             _start_cleanup(state)
 
@@ -900,11 +880,12 @@ def _start_cleanup(state: AnimState):
 
 
 def _end_cleanup(state: AnimState):
-    if state.plan.breakthrough_cols:
+    if state.plan.breakthrough_rows:
         state.phase = Phase.RECLAIM
         state.t = 0.0
-        # Snapshot frontier at reclaim start so we can do a clean linear interpolation
         state._reclaim_start_frontier = state.vis_frontier[:]
+        for (r, c) in state.plan.reclaimed_cells:
+            state.kill_cell(r, c)
     else:
         _start_slide_fill(state)
 
@@ -926,11 +907,10 @@ def _start_spawn(state: AnimState):
 # Rendering
 # ---------------------------------------------------------------------------
 
-DEATH_DUR = 0.38   # seconds for the particle-burst death animation
+DEATH_DUR = 0.38
 
 
 def draw_death_burst(surf, color_idx, cx, cy, age):
-    """5 coloured dots scatter from (cx, cy) — the cell's position at death."""
     t = min(age / DEATH_DUR, 1.0)
     alpha = int(255 * max(0.0, 1.0 - t) ** 0.55)
     if alpha <= 0:
@@ -951,22 +931,22 @@ def draw_death_burst(surf, color_idx, cx, cy, age):
 def draw_bg(surf, frontier):
     for r in range(GRID_ROWS):
         for c in range(GRID_COLS):
-            color = BG_TOP if r <= frontier[c] else BG_BOTTOM
+            color = BG_LEFT if c <= frontier[r] else BG_RIGHT
             pygame.draw.rect(surf, color, cell_rect(r, c))
 
 
 def draw_frontier_dots(surf, frontier):
-    for c in range(GRID_COLS):
-        f = frontier[c]
-        if f < 0 or f >= GRID_ROWS - 1:
+    for r in range(GRID_ROWS):
+        f = frontier[r]
+        if f < 0 or f >= GRID_COLS - 1:
             continue
-        y  = (f + 1) * CELL + GRID_Y
-        x0 = c * CELL + 5
-        x1 = (c + 1) * CELL - 5
-        x = x0
-        while x < x1:
-            pygame.draw.line(surf, C_FRONTIER, (x, y), (min(x+5, x1), y), 2)
-            x += 9
+        x  = (f + 1) * CELL
+        y0 = r * CELL + GRID_Y + 5
+        y1 = (r + 1) * CELL + GRID_Y - 5
+        y = y0
+        while y < y1:
+            pygame.draw.line(surf, C_FRONTIER, (x, y), (x, min(y+5, y1)), 2)
+            y += 9
 
 
 def draw_grid(surf):
@@ -978,22 +958,20 @@ def draw_grid(surf):
         pygame.draw.line(surf, C_GRID, (x, GRID_Y), (x, GRID_ROWS * CELL + GRID_Y), 1)
 
 
-def draw_static(surf, bs: BoardState, active_top=None, anim_t=0.0):
-    """Draw the board.  active_top: True/False animates only that side; None animates all."""
+def draw_static(surf, bs: BoardState, active_left=None, anim_t=0.0, glow=None):
     draw_bg(surf, bs.frontier)
+    if glow is not None:
+        glow.draw(surf, bs)          # ground rings under the units
     for r in range(GRID_ROWS):
         for c in range(GRID_COLS):
             ci = bs.board[r][c]
-            is_top = bs.owner_is_top(r, c)
-            t = anim_t if (active_top is None or is_top == active_top) else 0.0
-            draw_unit(surf, ci, cell_rect(r, c).inflate(-10, -10),
-                      filled=not is_top, anim_t=t)
+            is_left = bs.owner_is_left(r, c)
+            side = "left" if is_left else "right"
+            t = anim_t if (active_left is None or is_left == active_left) else 0.0
+            x, y = cell_xy(r, c)
+            draw_mage(surf, ci, side, x, y, anim_t=t)
     draw_frontier_dots(surf, bs.frontier)
     draw_grid(surf)
-
-
-def _unit_rect_at(pixel_y, c):
-    return pygame.Rect(c * CELL, pixel_y, CELL, CELL).inflate(-10, -10)
 
 
 def draw_animated(surf, state: AnimState, anim_t=0.0):
@@ -1002,44 +980,52 @@ def draw_animated(surf, state: AnimState, anim_t=0.0):
     final = plan.final_board
     phase = state.phase
 
-    # Local shortcut that bakes in the current anim_t for all unit draws.
-    def du(dst, ci, rect, filled, alpha=255):
-        draw_unit(dst, ci, rect, filled, alpha, anim_t)
+    atk_left  = plan.attacker_is_left
+    atk_side  = "left" if atk_left else "right"
+    def_side  = "right" if atk_left else "left"
+    direction = 1 if atk_left else -1
+
+    ball_f  = int(state.total_t / BALL_FRAME_S) % 4
+    cast_f  = min(2, int(state.total_t / CAST_FRAME_S))
+    tired_f = int(state.total_t / TIRED_FRAME_S) % 2
+    field_f = int(state.total_t / FIELD_FRAME_S) % 3
 
     draw_bg(surf, state.vis_frontier)
 
-    # Build lookup sets for fast decisions
     non_fmt_set = set(plan.non_fmt_atk_cells)
-    all_fmt_cells: dict = {}   # (r,c) → fmt_idx
+    all_fmt_cells: dict = {}
     for i, af in enumerate(plan.attack_formations):
-        for r in af.rows:
-            all_fmt_cells[(r, af.col)] = i
+        for c in af.cols:
+            all_fmt_cells[(af.row, c)] = i
 
-    def_cell_map: dict = {}    # (r,c) → defense formation id
+    def_cell_map: dict = {}
     for df in plan.defense_formations:
         for cell in df.cells:
             def_cell_map[cell] = df.formation_id
 
-    atk_top = plan.attacker_is_top
-    direction = 1 if atk_top else -1
+    # defenders hold their casting pose while formations are highlighted
+    defenders_casting = state.def_outline_alpha > 0 or phase == Phase.FMT_SLIDE
+
+    def side_of(r, c, board=orig):
+        return "left" if board.owner_is_left(r, c) else "right"
 
     for r in range(GRID_ROWS):
         for c in range(GRID_COLS):
             cell = (r, c)
             ci   = orig.board[r][c]
-            filled = not orig.owner_is_top(r, c)
+            side = side_of(r, c)
 
-            # ── Dead cells — play burst at where the unit actually died ─
+            # Dead cells — play burst at where the unit actually died
             if cell in state.dead:
                 if cell in state.dying:
-                    death_time, death_cy = state.dying[cell]
+                    death_time, death_cx = state.dying[cell]
                     age = state.total_t - death_time
                     if age < DEATH_DUR:
-                        death_cx = c * CELL + CELL // 2
+                        death_cy = r * CELL + GRID_Y + CELL // 2
                         draw_death_burst(surf, ci, death_cx, death_cy, age)
                 continue
 
-            # ── Non-formation attackers (fade out phase 1, fade in phase 5)
+            # Non-formation attackers (fade out phase 1, fade in phase 5)
             if cell in non_fmt_set:
                 alpha = int(state.non_fmt_alpha)
                 if alpha > 0:
@@ -1047,106 +1033,128 @@ def draw_animated(surf, state: AnimState, anim_t=0.0):
                         if cell in plan.atk_slide_map:
                             nr, nc = plan.atk_slide_map[cell]
                             tp = state.slide_progress
-                            py = int((r + (nr - r) * tp) * CELL + GRID_Y)
-                            du(surf, ci, _unit_rect_at(py, c), filled, 255)
+                            px = int((c + (nc - c) * tp) * CELL)
+                            draw_mage(surf, ci, side, px, r * CELL + GRID_Y,
+                                      255, anim_t)
                         else:
-                            du(surf, ci, cell_rect(r, c).inflate(-10,-10), filled, 255)
+                            x, y = cell_xy(r, c)
+                            draw_mage(surf, ci, side, x, y, 255, anim_t)
                     else:
-                        du(surf, ci, cell_rect(r,c).inflate(-10,-10), filled, alpha)
+                        x, y = cell_xy(r, c)
+                        draw_mage(surf, ci, side, x, y, alpha, anim_t)
                 continue
 
-            # ── Attack formation cells ───────────────────────────────────
+            # Attack formation cells
             if cell in all_fmt_cells:
                 fi = all_fmt_cells[cell]
                 if fi < state.cur_fmt_idx:
                     continue
                 elif fi == state.cur_fmt_idx and phase == Phase.FMT_SLIDE:
-                    fai = plan.fmt_anim[fi]
-                    n   = fai.soldiers_at(state.cur_slide_px)
-                    active = fai.initial_rows[-n:] if n > 0 else []
-                    if r in active:
-                        py = int(r * CELL + GRID_Y + state.cur_slide_px * direction)
-                        du(surf, ci, _unit_rect_at(py, c), filled, 255)
+                    if state.fmt_tf_t < TRANSFORM_DUR:
+                        # flash → collapse → orb, in place
+                        tf_i = min(2, int(state.fmt_tf_t / TF_FRAME_S))
+                        x, y = cell_xy(r, c)
+                        draw_mage(surf, ci, atk_side, x, y,
+                                  pose="tf", pose_frame=tf_i)
+                    else:
+                        fai = plan.fmt_anim[fi]
+                        n   = fai.soldiers_at(state.cur_slide_px)
+                        active = fai.initial_cols[-n:] if n > 0 else []
+                        if c in active:
+                            px = int(c * CELL + state.cur_slide_px * direction)
+                            draw_ball(surf, ci, atk_side, px,
+                                      r * CELL + GRID_Y, ball_f)
                 else:
-                    du(surf, ci, cell_rect(r,c).inflate(-10,-10), filled, 255)
+                    x, y = cell_xy(r, c)
+                    draw_mage(surf, ci, atk_side, x, y, 255, anim_t)
                 continue
 
-            # ── Defense formation cells ──────────────────────────────────
+            # Defense formation cells
             if cell in def_cell_map:
-                if cell in plan.def_slide_map and phase in (Phase.SLIDE_FILL, Phase.SPAWN, Phase.DONE):
+                did = def_cell_map[cell]
+                if cell in plan.def_slide_map and \
+                        phase in (Phase.SLIDE_FILL, Phase.SPAWN, Phase.DONE):
                     nr, nc = plan.def_slide_map[cell]
                     if phase == Phase.SLIDE_FILL:
                         tp = state.slide_progress
-                        py = int((r + (nr - r) * tp) * CELL + GRID_Y)
-                        du(surf, ci, _unit_rect_at(py, c), filled, 255)
+                        px = int((c + (nc - c) * tp) * CELL)
+                        draw_mage(surf, ci, side, px, r * CELL + GRID_Y,
+                                  255, anim_t)
                     else:
-                        du(surf, ci, cell_rect(nr,nc).inflate(-10,-10), filled, 255)
+                        x, y = cell_xy(nr, nc)
+                        draw_mage(surf, ci, side, x, y, 255, anim_t)
                 else:
-                    du(surf, ci, cell_rect(r,c).inflate(-10,-10), filled, 255)
+                    x, y = cell_xy(r, c)
+                    if did in state.red_def_ids:
+                        # spent: bowed over behind the weakened wall
+                        draw_mage(surf, ci, def_side, x, y,
+                                  pose="tired", pose_frame=tired_f)
+                    elif defenders_casting:
+                        draw_mage(surf, ci, def_side, x, y,
+                                  pose="cast", pose_frame=cast_f)
+                    else:
+                        draw_mage(surf, ci, side, x, y, 255, anim_t)
                 continue
 
-            # ── Attacker slide-fill cells ────────────────────────────────
+            # Attacker slide-fill cells
             if cell in plan.atk_slide_map:
                 nr, nc = plan.atk_slide_map[cell]
                 if phase == Phase.SLIDE_FILL:
                     tp = state.slide_progress
-                    py = int((r + (nr - r) * tp) * CELL + GRID_Y)
-                    du(surf, ci, _unit_rect_at(py, c), filled, 255)
+                    px = int((c + (nc - c) * tp) * CELL)
+                    draw_mage(surf, ci, side, px, r * CELL + GRID_Y, 255, anim_t)
                 elif phase in (Phase.SPAWN, Phase.DONE):
-                    du(surf, ci, cell_rect(nr,nc).inflate(-10,-10), filled, 255)
+                    x, y = cell_xy(nr, nc)
+                    draw_mage(surf, ci, side, x, y, 255, anim_t)
                 else:
-                    du(surf, ci, cell_rect(r,c).inflate(-10,-10), filled, 255)
+                    x, y = cell_xy(r, c)
+                    draw_mage(surf, ci, side, x, y, 255, anim_t)
                 continue
 
-            # ── Defender slide-fill cells ────────────────────────────────
+            # Defender slide-fill cells
             if cell in plan.def_slide_map:
                 nr, nc = plan.def_slide_map[cell]
                 if phase == Phase.SLIDE_FILL:
                     tp = state.slide_progress
-                    py = int((r + (nr - r) * tp) * CELL + GRID_Y)
-                    du(surf, ci, _unit_rect_at(py, c), not final.owner_is_top(r, c), 255)
+                    px = int((c + (nc - c) * tp) * CELL)
+                    draw_mage(surf, ci, side_of(r, c, final), px,
+                              r * CELL + GRID_Y, 255, anim_t)
                 elif phase in (Phase.SPAWN, Phase.DONE):
-                    du(surf, ci, cell_rect(nr,nc).inflate(-10,-10),
-                       not final.owner_is_top(nr, nc), 255)
+                    x, y = cell_xy(nr, nc)
+                    draw_mage(surf, ci, side_of(nr, nc, final), x, y, 255, anim_t)
                 else:
-                    du(surf, ci, cell_rect(r,c).inflate(-10,-10), filled, 255)
+                    x, y = cell_xy(r, c)
+                    draw_mage(surf, ci, side, x, y, 255, anim_t)
                 continue
 
-            # ── Normal cell ──────────────────────────────────────────────
-            du(surf, ci, cell_rect(r,c).inflate(-10,-10), filled, 255)
+            # Normal cell
+            x, y = cell_xy(r, c)
+            draw_mage(surf, ci, side, x, y, 255, anim_t)
 
-    # Spawn cells (phase 8) — taken from final_board
+    # Spawn cells (fade-in of reinforcements)
     if phase in (Phase.SPAWN, Phase.DONE):
         alpha = int(state.spawn_alpha)
-        for (r, c) in plan.atk_spawn_cells:
+        for (r, c) in plan.atk_spawn_cells + plan.def_spawn_cells:
             ci = final.board[r][c]
-            du(surf, ci, cell_rect(r,c).inflate(-10,-10),
-               not final.owner_is_top(r, c), alpha)
-        for (r, c) in plan.def_spawn_cells:
-            ci = final.board[r][c]
-            du(surf, ci, cell_rect(r,c).inflate(-10,-10),
-               not final.owner_is_top(r, c), alpha)
+            x, y = cell_xy(r, c)
+            draw_mage(surf, ci, side_of(r, c, final), x, y, alpha, anim_t)
 
-    # Defense formation outlines
+    # Force fields along defense formations (replaces the old outlines)
     alpha = int(state.def_outline_alpha)
     if alpha > 0:
         for df in plan.defense_formations:
-            if df.formation_id in state.red_def_ids or \
-               df.formation_id in plan.hit_def_ids:
-                oc = (*C_DEF_HIT, alpha)
-            else:
-                oc = (*C_DEF_NORMAL, alpha)
+            damaged = df.formation_id in state.red_def_ids
             for (r, c) in df.cells:
                 if (r, c) in state.dead:
                     continue
-                s = pygame.Surface((CELL, CELL), pygame.SRCALPHA)
-                pygame.draw.rect(s, oc, (1, 1, CELL-2, CELL-2), 3)
-                surf.blit(s, cell_rect(r, c).topleft)
+                ci = orig.board[r][c]
+                x, y = cell_xy(r, c)
+                draw_field(surf, ci, def_side, x, y, field_f,
+                           damaged=damaged, alpha=alpha)
 
     draw_frontier_dots(surf, state.vis_frontier)
     draw_grid(surf)
 
-    # Red flash overlay for breakthrough
     if state.flash_alpha > 0:
         ov = pygame.Surface((GRID_COLS * CELL, GRID_ROWS * CELL), pygame.SRCALPHA)
         ov.fill((255, 0, 0, int(min(state.flash_alpha, 160))))
@@ -1154,41 +1162,121 @@ def draw_animated(surf, state: AnimState, anim_t=0.0):
 
 
 # ---------------------------------------------------------------------------
+# Selection glow — blue ground rings under units of the picked colors
+# ---------------------------------------------------------------------------
+
+GLOW_RGB = (80, 170, 255)
+
+
+class SelectionGlow:
+    """While a color is selected in the picker, the ground under every
+    matching unit on the picking side glows: a soft ellipse that grows out
+    from the center on selection, plus a repeating ripple ring that fades
+    as it expands. Deselecting (or submitting) fades it back out."""
+
+    FADE_IN  = 5.0     # selection alpha per second
+    FADE_OUT = 3.0
+    PERIOD   = 0.9     # ripple loop seconds
+    GROUND_Y = 0.78    # ring center, as a fraction of the cell height
+
+    def __init__(self):
+        self.alpha = {}    # (is_left, color) -> 0..1
+        self.t = 0.0
+
+    def update(self, dt, selected):
+        """selected: set of (is_left, color) currently picked."""
+        self.t += dt
+        for key in selected:
+            self.alpha[key] = min(1.0, self.alpha.get(key, 0.0)
+                                  + dt * self.FADE_IN)
+        for key in list(self.alpha):
+            if key not in selected:
+                a = self.alpha[key] - dt * self.FADE_OUT
+                if a <= 0:
+                    del self.alpha[key]
+                else:
+                    self.alpha[key] = a
+
+    def active(self):
+        return bool(self.alpha)
+
+    def draw(self, surf, bs):
+        if not self.alpha:
+            return
+        p = (self.t / self.PERIOD) % 1.0
+        for (is_left, ci), a in self.alpha.items():
+            for r in range(GRID_ROWS):
+                for c in range(GRID_COLS):
+                    if bs.board[r][c] != ci or \
+                            bs.owner_is_left(r, c) != is_left:
+                        continue
+                    self._cell_glow(surf, r, c, a, p)
+
+    def _cell_glow(self, surf, r, c, a, p):
+        # drawn additively so it reads as light on both territory colors
+        s = pygame.Surface((CELL, CELL), pygame.SRCALPHA)
+        cx = CELL // 2
+        cy = int(CELL * self.GROUND_Y)
+
+        def scaled(k):
+            return tuple(min(255, int(ch * k)) for ch in GLOW_RGB)
+
+        # soft ground glow, growing out from the center with selection
+        grow = 0.35 + 0.65 * a
+        rx = int(CELL * 0.38 * grow)
+        ry = max(3, int(rx * 0.42))
+        pygame.draw.ellipse(s, scaled(0.55 * a),
+                            (cx - rx, cy - ry, rx * 2, ry * 2))
+        pygame.draw.ellipse(s, scaled(0.85 * a),
+                            (cx - rx // 2, cy - max(2, ry // 2), rx, max(4, ry)))
+
+        # ripple ring: expands outward and fades as it goes
+        rr = int(4 + p * CELL * 0.46)
+        rry = max(2, int(rr * 0.42))
+        ring_k = a * (1.0 - p)
+        if ring_k > 0.02 and rr > 0:
+            pygame.draw.ellipse(s, scaled(1.4 * ring_k),
+                                (cx - rr, cy - rry, rr * 2, rry * 2), 3)
+
+        surf.blit(s, (c * CELL, r * CELL + GRID_Y),
+                  special_flags=pygame.BLEND_RGB_ADD)
+
+
+# ---------------------------------------------------------------------------
 # HUD / Sidebar
 # ---------------------------------------------------------------------------
 
-def draw_hud(surf, fonts, atk_is_top, turn):
-    """Top bar: title + turn indicator only. HP lives on the player bars."""
+def draw_hud(surf, fonts, atk_is_left, turn):
     font, bfont, _ = fonts
     pygame.draw.rect(surf, BG_HUD, (0, 0, SCREEN_W, HUD_H))
     title = bfont.render("MAGE GRID", True, (215, 192, 120))
     surf.blit(title, (8, 6))
-    who = f"Turn {turn}  ·  {'TOP' if atk_is_top else 'BOTTOM'} attacks"
+    who = f"Turn {turn}  ·  {'LEFT' if atk_is_left else 'RIGHT'} attacks"
     surf.blit(font.render(who, True, (160, 160, 160)), (8, 30))
 
 
-def draw_player_bars(surf, fonts, top_name, bot_name, hp_top, hp_bottom):
-    """Name + HP bar strip directly above and below the grid."""
+def draw_player_bars(surf, fonts, left_name, right_name, hp_left, hp_right):
+    """Name + HP bar split above the grid: left half = left player, right half = right player."""
     font, bfont, _ = fonts
     grid_w = GRID_COLS * CELL
+    mid_x  = (GRID_COLS // 2) * CELL   # pixel x of the grid midpoint
+    ty     = HUD_H
 
-    # ── Top player bar ──────────────────────────────────────────────────
-    ty = HUD_H
-    pygame.draw.rect(surf, (42, 26, 10), (0, ty, grid_w, PLAYER_BAR_H))
-    name_s = bfont.render(top_name, True, (210, 185, 140))
+    # Left player bar (dark background, above left territory)
+    pygame.draw.rect(surf, (42, 26, 10), (0, ty, mid_x, PLAYER_BAR_H))
+    name_s = bfont.render(left_name, True, (210, 185, 140))
     surf.blit(name_s, (8, ty + (PLAYER_BAR_H - name_s.get_height()) // 2))
-    _player_hp_bar(surf, font, hp_top,
-                   grid_w - 202, ty + (PLAYER_BAR_H - 14) // 2,
-                   160, (90, 145, 255))
+    _player_hp_bar(surf, font, hp_left,
+                   mid_x - 180, ty + (PLAYER_BAR_H - 14) // 2,
+                   140, (90, 145, 255))
 
-    # ── Bottom player bar ────────────────────────────────────────────────
-    by_ = GRID_Y + GRID_ROWS * CELL
-    pygame.draw.rect(surf, (115, 82, 40), (0, by_, grid_w, PLAYER_BAR_H))
-    name_s = bfont.render(bot_name, True, (255, 240, 195))
-    surf.blit(name_s, (8, by_ + (PLAYER_BAR_H - name_s.get_height()) // 2))
-    _player_hp_bar(surf, font, hp_bottom,
-                   grid_w - 202, by_ + (PLAYER_BAR_H - 14) // 2,
-                   160, (255, 100, 45))
+    # Right player bar (light background, above right territory)
+    pygame.draw.rect(surf, (115, 82, 40), (mid_x, ty, grid_w - mid_x, PLAYER_BAR_H))
+    name_s = bfont.render(right_name, True, (255, 240, 195))
+    surf.blit(name_s, (mid_x + 8, ty + (PLAYER_BAR_H - name_s.get_height()) // 2))
+    _player_hp_bar(surf, font, hp_right,
+                   grid_w - 180, ty + (PLAYER_BAR_H - 14) // 2,
+                   140, (255, 100, 45))
 
 
 def _player_hp_bar(surf, font, hp, x, y, bw, color):
@@ -1201,18 +1289,17 @@ def _player_hp_bar(surf, font, hp, x, y, bw, color):
     surf.blit(hp_s, (x + bw + 6, y + 1))
 
 
+def _mini_sprite(color_idx, kind, side, size):
+    surf = SPRITES[color_idx][kind][side][0]
+    return pygame.transform.scale(surf, (size, size))
+
+
 def draw_sidebar(surf, fonts, sx, gs, pick_info=None):
-    """
-    pick_info (only during color-select phase):
-        {"who": str, "role": str, "role_color": tuple,
-         "confirm_msg": str, "confirm_timer": float}
-    """
     font, bfont, _ = fonts
     pygame.draw.rect(surf, BG_SIDEBAR, (sx, 0, SIDEBAR_W, SCREEN_H))
 
     y = HUD_H + 10
 
-    # ── Who is picking (pick phase only) ────────────────────────────────
     if pick_info:
         lbl = bfont.render(
             f"{pick_info['who']}  —  {pick_info['role']}",
@@ -1224,34 +1311,31 @@ def draw_sidebar(surf, fonts, sx, gs, pick_info=None):
         if pick_info.get("confirm_msg") and pick_info.get("confirm_timer", 0) > 0:
             cm = font.render(pick_info["confirm_msg"], True, (150, 240, 125))
             surf.blit(cm, (sx + 8, y))
-        y += 20  # fixed gap whether or not confirm is shown
+        y += 20
 
         pygame.draw.line(surf, (55, 50, 44),
                          (sx + 8, y), (sx + SIDEBAR_W - 8, y), 1)
         y += 10
 
-    # ── Color legend ────────────────────────────────────────────────────
     surf.blit(bfont.render("Colors", True, (200, 178, 110)), (sx + 8, y)); y += 22
     for i in range(NUM_COLORS):
-        pygame.draw.circle(surf, UNIT_RGB[i], (sx + 20, y + 8), 7)
+        surf.blit(_mini_sprite(i, "idle", "left", 20), (sx + 10, y - 2))
         surf.blit(font.render(f"[{COLOR_KEYS[i]}] {COLOR_NAMES[i]}",
-                              True, (195, 195, 195)), (sx + 32, y))
-        y += 20
-    y += 10
+                              True, (195, 195, 195)), (sx + 34, y))
+        y += 21
+    y += 9
 
-    # ── Confirmed selections (pick phase only) ───────────────────────────
     if "atk_colors" in gs:
         surf.blit(font.render("Attack:", True, (255, 155, 70)), (sx + 8, y))
         for i, ci in enumerate(gs["atk_colors"]):
-            pygame.draw.circle(surf, UNIT_RGB[ci], (sx + 78 + i * 24, y + 8), 8)
+            surf.blit(_mini_sprite(ci, "ball", "left", 18), (sx + 70 + i * 24, y))
         y += 24
     if "def_colors" in gs:
         surf.blit(font.render("Defend:", True, (70, 185, 255)), (sx + 8, y))
         for i, ci in enumerate(gs["def_colors"]):
-            pygame.draw.circle(surf, UNIT_RGB[ci], (sx + 78 + i * 24, y + 8), 8)
+            surf.blit(_mini_sprite(ci, "fld", "left", 18), (sx + 70 + i * 24, y))
         y += 24
 
-    # ── Footer ──────────────────────────────────────────────────────────
     fy = SCREEN_H - 72
     pygame.draw.line(surf, (55, 50, 44),
                      (sx + 8, fy), (sx + SIDEBAR_W - 8, fy), 1)
@@ -1271,8 +1355,6 @@ class ColorPicker:
     def __init__(self, sx):
         self.sx  = sx
         self.sel = []
-        # Sits below the color legend in the sidebar.
-        # legend starts at ~HUD_H+92 (with pick_info header above), 5×20px = 100px → ~HUD_H+214
         y0 = HUD_H + 222
         self.btns = [(pygame.Rect(sx+8+i*(self.SZ+6), y0, self.SZ, self.SZ), i)
                      for i in range(NUM_COLORS)]
@@ -1354,7 +1436,6 @@ class TextInput:
 def draw_title(surf, fonts, t):
     _, bfont, tfont = fonts
     surf.fill((12, 8, 4))
-    # Animated stars
     for i in range(40):
         random.seed(i * 131 + 7)
         x = random.randint(0, SCREEN_W)
@@ -1363,10 +1444,20 @@ def draw_title(surf, fonts, t):
         s = pygame.Surface((3,3), pygame.SRCALPHA)
         pygame.draw.circle(s, (210,195,140,a), (1,1), 1)
         surf.blit(s, (x,y))
+    random.seed()
     title = tfont.render("MAGE GRID", True, (218, 192, 100))
     surf.blit(title, (SCREEN_W//2 - title.get_width()//2, SCREEN_H//3 - 50))
     sub = bfont.render("A tactical grid battle", True, (150,140,120))
     surf.blit(sub, (SCREEN_W//2 - sub.get_width()//2, SCREEN_H//3 + 38))
+
+    # the five mages idle across the title screen
+    seq_f = IDLE_SEQ[int(t / IDLE_FRAME_S) % len(IDLE_SEQ)]
+    total_w = NUM_COLORS * SPRITE_PX + (NUM_COLORS - 1) * 18
+    x0 = SCREEN_W // 2 - total_w // 2
+    for i in range(NUM_COLORS):
+        surf.blit(SPRITES[i]["idle"]["left"][seq_f],
+                  (x0 + i * (SPRITE_PX + 18), SCREEN_H // 2 - 20))
+
     pulse = int(190 + 60 * math.sin(t * 2.6))
     go = bfont.render("Press ENTER to begin", True, (pulse, pulse, pulse))
     surf.blit(go, (SCREEN_W//2 - go.get_width()//2, SCREEN_H//2 + 60))
@@ -1379,8 +1470,9 @@ def draw_title(surf, fonts, t):
 def main():
     pygame.init()
     screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
-    pygame.display.set_caption("Mage Grid")
+    pygame.display.set_caption("Mage Grid — Sprite Edition")
     clock = pygame.time.Clock()
+    load_sprites()
 
     font   = pygame.font.SysFont("segoeui",    16)
     bfont  = pygame.font.SysFont("segoeui",    18, bold=True)
@@ -1390,19 +1482,19 @@ def main():
 
     phase        = "title"
     t            = 0.0
-    top_name     = "Top"
-    bot_name     = "Bottom"
+    left_name    = "Left"
+    right_name   = "Right"
     bs: BoardState = make_board()
     turn         = 1
-    atk_is_top   = True
+    atk_is_left  = True
     anim: Optional[AnimState] = None
 
-    # Name entry
     name_step = 0
-    inputs    = [TextInput("Top player name:"), TextInput("Bottom player name:")]
+    inputs    = [TextInput("Left player name:"), TextInput("Right player name:")]
 
     picker     = ColorPicker(sx)
-    color_step = 0     # 0=attacker picks, 1=defender picks
+    glow       = SelectionGlow()
+    color_step = 0
     atk_colors = None
     def_colors = None
     confirm_msg   = ""
@@ -1429,8 +1521,8 @@ def main():
                     if inputs[name_step].handle(ev):
                         name_step += 1
                         if name_step >= 2:
-                            top_name = inputs[0].value()
-                            bot_name = inputs[1].value()
+                            left_name  = inputs[0].value()
+                            right_name = inputs[1].value()
                             bs = make_board()
                             phase = "pick"; color_step = 0; picker.reset()
                             gs = {"phase": "pick"}
@@ -1447,7 +1539,7 @@ def main():
                             confirm_timer = 1.8
                         else:
                             def_colors = picker.get()
-                            plan = build_combat_plan(bs, atk_is_top,
+                            plan = build_combat_plan(bs, atk_is_left,
                                                      atk_colors, def_colors)
                             anim  = AnimState(plan, bs)
                             phase = "anim"
@@ -1463,17 +1555,16 @@ def main():
                 if ev.type == pygame.KEYDOWN and ev.key == pygame.K_RETURN:
                     phase = "title"
 
-        # Update
         if phase == "name_entry":
             inputs[name_step].update(dt)
 
         if phase == "anim" and anim is not None:
             if advance_anim(anim, dt):
-                bs         = anim.plan.final_board
-                turn      += 1
-                atk_is_top = not atk_is_top
-                anim       = None
-                if bs.hp_top <= 0 or bs.hp_bottom <= 0:
+                bs          = anim.plan.final_board
+                turn       += 1
+                atk_is_left = not atk_is_left
+                anim        = None
+                if bs.hp_left <= 0 or bs.hp_right <= 0:
                     phase = "gameover"; gs = {"phase": "gameover"}
                 else:
                     phase = "pick"; color_step = 0; picker.reset()
@@ -1496,14 +1587,15 @@ def main():
                          active=(i == name_step))
 
         elif phase == "pick":
-            # Animate whichever side is currently picking colors.
-            picking_top = atk_is_top if color_step == 0 else (not atk_is_top)
-            draw_static(screen, bs, active_top=picking_top, anim_t=t)
-            draw_hud(screen, fonts, atk_is_top, turn)
-            draw_player_bars(screen, fonts, top_name, bot_name,
-                             bs.hp_top, bs.hp_bottom)
-            atker = top_name if atk_is_top else bot_name
-            defer = bot_name  if atk_is_top else top_name
+            picking_left = atk_is_left if color_step == 0 else (not atk_is_left)
+            glow.update(dt, {(picking_left, ci) for ci in picker.sel})
+            draw_static(screen, bs, active_left=picking_left, anim_t=t,
+                        glow=glow)
+            draw_hud(screen, fonts, atk_is_left, turn)
+            draw_player_bars(screen, fonts, left_name, right_name,
+                             bs.hp_left, bs.hp_right)
+            atker = left_name  if atk_is_left else right_name
+            defer = right_name if atk_is_left else left_name
             who   = atker if color_step == 0 else defer
             role  = "ATTACKING" if color_step == 0 else "DEFENDING"
             rc    = (255, 155, 55) if color_step == 0 else (65, 175, 255)
@@ -1515,27 +1607,30 @@ def main():
             picker.draw(screen, font)
 
         elif phase == "anim" and anim is not None:
-            # Animate all units during the combat sequence.
             draw_animated(screen, anim, anim_t=t)
-            draw_hud(screen, fonts, atk_is_top, turn)
-            draw_player_bars(screen, fonts, top_name, bot_name,
-                             bs.hp_top, bs.hp_bottom)
+            # the defender's last selection rings fade out as combat begins
+            glow.update(dt, set())
+            if glow.active():
+                glow.draw(screen, anim.orig)
+            draw_hud(screen, fonts, atk_is_left, turn)
+            draw_player_bars(screen, fonts, left_name, right_name,
+                             bs.hp_left, bs.hp_right)
             draw_sidebar(screen, fonts, sx, gs)
 
         elif phase == "gameover":
             draw_static(screen, bs)
-            draw_hud(screen, fonts, atk_is_top, turn)
-            draw_player_bars(screen, fonts, top_name, bot_name,
-                             bs.hp_top, bs.hp_bottom)
+            draw_hud(screen, fonts, atk_is_left, turn)
+            draw_player_bars(screen, fonts, left_name, right_name,
+                             bs.hp_left, bs.hp_right)
             ov = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
             ov.fill((0,0,0,155)); screen.blit(ov, (0,0))
             cx = SCREEN_W // 2
-            if bs.hp_top <= 0 and bs.hp_bottom <= 0:
+            if bs.hp_left <= 0 and bs.hp_right <= 0:
                 msg = "DRAW!"
-            elif bs.hp_top <= 0:
-                msg = f"{bot_name} WINS!"
+            elif bs.hp_left <= 0:
+                msg = f"{right_name} WINS!"
             else:
-                msg = f"{top_name} WINS!"
+                msg = f"{left_name} WINS!"
             wl = tfont.render(msg, True, (255, 218, 70))
             screen.blit(wl, (cx - wl.get_width()//2, SCREEN_H//3))
             sub = font.render("Press ENTER to return to title", True, (175,175,175))
