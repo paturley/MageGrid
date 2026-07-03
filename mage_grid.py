@@ -18,7 +18,7 @@ Same rules and combat engine as mage_grid.py, with pixel-art mage sprites:
 
 Sprites are loaded from assets/sprites.png (regenerate with gen_sprites.py).
 
-Run:  python3 mage_grid_sprite.py
+Run:  python3 mage_grid.py
 """
 
 import os
@@ -51,10 +51,10 @@ FPS = 60
 # Color / unit definitions
 # ---------------------------------------------------------------------------
 
-COLOR_NAMES = ["Blue",  "Red",    "Yellow", "Green", "White"]
-COLOR_KEYS  = ["B",     "R",      "Y",      "G",     "W"]
-NUM_COLORS  = 5
-HP_MAX      = 10
+ELEM_NAMES = ["Water", "Fire", "Lightning", "Nature", "Rock"]
+ELEM_KEYS  = ["W",     "F",    "L",         "N",      "R"]
+NUM_COLORS = 5
+HP_MAX     = 10
 
 UNIT_RGB = {
     0: (90,  150, 255),   # Blue   — water
@@ -1215,6 +1215,37 @@ def draw_animated(surf, state: AnimState, anim_t=0.0):
 GLOW_RGB = (80, 170, 255)
 
 
+def draw_ground_glow(dest, x, y, size, a, phase, ground_y=0.78):
+    """Additive blue ground glow + expanding ripple ring, centered near the
+    bottom of a size x size box whose top-left is (x, y). Used under units
+    on the grid and under the element-picker buttons."""
+    s = pygame.Surface((size, size), pygame.SRCALPHA)
+    cx = size // 2
+    cy = int(size * ground_y)
+
+    def scaled(k):
+        return tuple(min(255, int(ch * k)) for ch in GLOW_RGB)
+
+    # soft ground glow, growing out from the center with selection
+    grow = 0.35 + 0.65 * a
+    rx = int(size * 0.38 * grow)
+    ry = max(3, int(rx * 0.42))
+    pygame.draw.ellipse(s, scaled(0.55 * a),
+                        (cx - rx, cy - ry, rx * 2, ry * 2))
+    pygame.draw.ellipse(s, scaled(0.85 * a),
+                        (cx - rx // 2, cy - max(2, ry // 2), rx, max(4, ry)))
+
+    # ripple ring: expands outward and fades as it goes
+    rr = int(4 + phase * size * 0.46)
+    rry = max(2, int(rr * 0.42))
+    ring_k = a * (1.0 - phase)
+    if ring_k > 0.02 and rr > 0:
+        pygame.draw.ellipse(s, scaled(1.4 * ring_k),
+                            (cx - rr, cy - rry, rr * 2, rry * 2), 3)
+
+    dest.blit(s, (x, y), special_flags=pygame.BLEND_RGB_ADD)
+
+
 class SelectionGlow:
     """While a color is selected in the picker, the ground under every
     matching unit on the picking side glows: a soft ellipse that grows out
@@ -1260,33 +1291,8 @@ class SelectionGlow:
                     self._cell_glow(surf, r, c, a, p)
 
     def _cell_glow(self, surf, r, c, a, p):
-        # drawn additively so it reads as light on both territory colors
-        s = pygame.Surface((CELL, CELL), pygame.SRCALPHA)
-        cx = CELL // 2
-        cy = int(CELL * self.GROUND_Y)
-
-        def scaled(k):
-            return tuple(min(255, int(ch * k)) for ch in GLOW_RGB)
-
-        # soft ground glow, growing out from the center with selection
-        grow = 0.35 + 0.65 * a
-        rx = int(CELL * 0.38 * grow)
-        ry = max(3, int(rx * 0.42))
-        pygame.draw.ellipse(s, scaled(0.55 * a),
-                            (cx - rx, cy - ry, rx * 2, ry * 2))
-        pygame.draw.ellipse(s, scaled(0.85 * a),
-                            (cx - rx // 2, cy - max(2, ry // 2), rx, max(4, ry)))
-
-        # ripple ring: expands outward and fades as it goes
-        rr = int(4 + p * CELL * 0.46)
-        rry = max(2, int(rr * 0.42))
-        ring_k = a * (1.0 - p)
-        if ring_k > 0.02 and rr > 0:
-            pygame.draw.ellipse(s, scaled(1.4 * ring_k),
-                                (cx - rr, cy - rry, rr * 2, rry * 2), 3)
-
-        surf.blit(s, (c * CELL, r * CELL + GRID_Y),
-                  special_flags=pygame.BLEND_RGB_ADD)
+        draw_ground_glow(surf, c * CELL, r * CELL + GRID_Y, CELL, a, p,
+                         ground_y=self.GROUND_Y)
 
 
 # ---------------------------------------------------------------------------
@@ -1352,7 +1358,7 @@ def draw_sidebar(surf, fonts, sx, gs, pick_info=None):
             f"{pick_info['who']}  —  {pick_info['role']}",
             True, pick_info["role_color"])
         surf.blit(lbl, (sx + 8, y)); y += lbl.get_height() + 4
-        inst = font.render("Pick 2 colors, then Enter", True, (140, 140, 135))
+        inst = font.render("Pick 2 elements, then Enter", True, (140, 140, 135))
         surf.blit(inst, (sx + 8, y)); y += inst.get_height() + 4
 
         if pick_info.get("confirm_msg") and pick_info.get("confirm_timer", 0) > 0:
@@ -1364,10 +1370,13 @@ def draw_sidebar(surf, fonts, sx, gs, pick_info=None):
                          (sx + 8, y), (sx + SIDEBAR_W - 8, y), 1)
         y += 10
 
-    surf.blit(bfont.render("Colors", True, (200, 178, 110)), (sx + 8, y)); y += 22
+    legend_side = "left"
+    if pick_info and not pick_info.get("picking_left", True):
+        legend_side = "right"
+    surf.blit(bfont.render("Elements", True, (200, 178, 110)), (sx + 8, y)); y += 22
     for i in range(NUM_COLORS):
-        surf.blit(_mini_sprite(i, "idle", "left", 20), (sx + 10, y - 2))
-        surf.blit(font.render(f"[{COLOR_KEYS[i]}] {COLOR_NAMES[i]}",
+        surf.blit(_mini_sprite(i, "idle", legend_side, 20), (sx + 10, y - 2))
+        surf.blit(font.render(f"[{ELEM_KEYS[i]}] {ELEM_NAMES[i]}",
                               True, (195, 195, 195)), (sx + 34, y))
         y += 21
     y += 9
@@ -1387,28 +1396,43 @@ def draw_sidebar(surf, fonts, sx, gs, pick_info=None):
     pygame.draw.line(surf, (55, 50, 44),
                      (sx + 8, fy), (sx + SIDEBAR_W - 8, fy), 1)
     fy += 8
-    for line in ["B R Y G W = colors", "Enter to confirm", "Click to select"]:
+    for line in ["W F L N R = elements", "Enter to confirm", "Click to select"]:
         surf.blit(font.render(line, True, (105, 103, 96)), (sx + 8, fy))
         fy += 18
 
 
 # ---------------------------------------------------------------------------
-# Color picker widget
+# Element picker widget — each button shows the picking side's unit sprite
+# standing on its own territory, with the same blue ground glow the units
+# get on the grid fading in and out while the element is selected.
 # ---------------------------------------------------------------------------
 
-class ColorPicker:
-    SZ = 38
+class ElementPicker:
+    SZ = 40                       # button size (sprite drawn at 36px inside)
+    SPR = 36
 
     def __init__(self, sx):
         self.sx  = sx
         self.sel = []
+        self.t   = 0.0
+        self.glow_a = {}          # element -> 0..1 selection fade
         y0 = HUD_H + 222
-        self.btns = [(pygame.Rect(sx+8+i*(self.SZ+6), y0, self.SZ, self.SZ), i)
+        self.btns = [(pygame.Rect(sx+8+i*(self.SZ+4), y0, self.SZ, self.SZ), i)
                      for i in range(NUM_COLORS)]
 
     def reset(self):  self.sel = []
     def ready(self):  return len(self.sel) == 2
     def get(self):    return tuple(self.sel)
+
+    def update(self, dt):
+        self.t += dt
+        for ci in range(NUM_COLORS):
+            a = self.glow_a.get(ci, 0.0)
+            if ci in self.sel:
+                a = min(1.0, a + dt * SelectionGlow.FADE_IN)
+            else:
+                a = max(0.0, a - dt * SelectionGlow.FADE_OUT)
+            self.glow_a[ci] = a
 
     def handle_click(self, pos):
         for rect, ci in self.btns:
@@ -1419,25 +1443,35 @@ class ColorPicker:
         return False
 
     def handle_key(self, key):
-        km = {pygame.K_b:0, pygame.K_r:1, pygame.K_y:2, pygame.K_g:3, pygame.K_w:4}
+        km = {pygame.K_w: 0, pygame.K_f: 1, pygame.K_l: 2,
+              pygame.K_n: 3, pygame.K_r: 4}
         ci = km.get(key)
         if ci is not None:
             if ci in self.sel: self.sel.remove(ci)
             elif len(self.sel) < 2: self.sel.append(ci)
 
-    def draw(self, surf, font):
+    def draw(self, surf, font, side="left", anim_t=0.0):
+        phase = (self.t / SelectionGlow.PERIOD) % 1.0
+        bg = BG_LEFT if side == "left" else BG_RIGHT
+        pad = (self.SZ - self.SPR) // 2
         for rect, ci in self.btns:
-            pygame.draw.rect(surf, UNIT_RGB[ci], rect, border_radius=7)
-            bw = 3 if ci in self.sel else 1
-            bc = (255,255,255) if ci in self.sel else (70,70,70)
-            pygame.draw.rect(surf, bc, rect, bw, border_radius=7)
-            surf.blit(font.render(COLOR_KEYS[ci], True, (0,0,0)),
-                      (rect.x+13, rect.y+11))
+            pygame.draw.rect(surf, bg, rect, border_radius=6)
+            a = self.glow_a.get(ci, 0.0)
+            if a > 0:
+                draw_ground_glow(surf, rect.x, rect.y, self.SZ, a, phase)
+            sprite = SPRITES[ci]["idle"][side][idle_frame(anim_t)]
+            sprite = pygame.transform.scale(sprite, (self.SPR, self.SPR))
+            surf.blit(sprite, (rect.x + pad, rect.y + pad))
+            key_s = font.render(ELEM_KEYS[ci], True, (235, 225, 200))
+            surf.blit(font.render(ELEM_KEYS[ci], True, (20, 15, 10)),
+                      (rect.x + 4, rect.y + 1))
+            surf.blit(key_s, (rect.x + 3, rect.y))
+            pygame.draw.rect(surf, (90, 80, 66), rect, 1, border_radius=6)
         y = self.btns[0][0].bottom + 8
         if self.sel:
-            txt = " + ".join(COLOR_NAMES[ci] for ci in self.sel)
+            txt = " + ".join(ELEM_NAMES[ci] for ci in self.sel)
         else:
-            txt = "Pick 2 colors"
+            txt = "Pick 2 elements"
         surf.blit(font.render(txt, True, (195,195,175)), (self.sx+8, y))
 
 
@@ -1539,7 +1573,7 @@ def main():
     name_step = 0
     inputs    = [TextInput("Left player name:"), TextInput("Right player name:")]
 
-    picker     = ColorPicker(sx)
+    picker     = ElementPicker(sx)
     glow       = SelectionGlow()
     color_step = 0
     atk_colors = None
@@ -1581,8 +1615,8 @@ def main():
                             atk_colors = picker.get()
                             color_step = 1; picker.reset()
                             confirm_msg = (f"Attack: "
-                                f"{COLOR_NAMES[atk_colors[0]]} + "
-                                f"{COLOR_NAMES[atk_colors[1]]}")
+                                f"{ELEM_NAMES[atk_colors[0]]} + "
+                                f"{ELEM_NAMES[atk_colors[1]]}")
                             confirm_timer = 1.8
                         else:
                             def_colors = picker.get()
@@ -1635,6 +1669,7 @@ def main():
 
         elif phase == "pick":
             picking_left = atk_is_left if color_step == 0 else (not atk_is_left)
+            picker.update(dt)
             glow.update(dt, {(picking_left, ci) for ci in picker.sel})
             draw_static(screen, bs, active_left=picking_left, anim_t=t,
                         glow=glow)
@@ -1648,10 +1683,12 @@ def main():
             rc    = (255, 155, 55) if color_step == 0 else (65, 175, 255)
             pick_info = {
                 "who": who, "role": role, "role_color": rc,
+                "picking_left": picking_left,
                 "confirm_msg": confirm_msg, "confirm_timer": confirm_timer,
             }
             draw_sidebar(screen, fonts, sx, gs, pick_info)
-            picker.draw(screen, font)
+            picker.draw(screen, font,
+                        side="left" if picking_left else "right", anim_t=t)
 
         elif phase == "anim" and anim is not None:
             draw_animated(screen, anim, anim_t=t)
