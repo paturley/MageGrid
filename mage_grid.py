@@ -299,16 +299,23 @@ class FmtAnimInfo:
     initial_cols: list       # cols[0]=front
     attacker_is_left: bool
     frontier_at_start: int   # frontier[row] when this formation begins
-    kills: int
-    killed_def_cols: list    # defender cols killed, in order
+    # march events in order:
+    #   ("kill", col) - a soldier is spent killing the defender there
+    #   ("hole", col) - free advance through a tile already emptied by an
+    #                   earlier flank this turn
+    events: list
     blocked_by: Optional[int]
     breakthrough: bool
-    # vert_captures[k] = list of (r, c) triangle tiles captured up/down as the
-    # (k+1)-th forward soldier advances. Aligned with kill_px / killed_def_cols.
-    vert_captures: list = field(default_factory=list)
+    # flank_cells[k] = defender cells killed by the flanking cascade at the
+    # moment the (k+1)-th forward kill lands (no territory changes hands
+    # until after all attacks). flank_dfids[k] = defense formations hit
+    # (weakened) by the cascade at that moment.
+    flank_cells: list = field(default_factory=list)
+    flank_dfids: list = field(default_factory=list)
 
     frontier_cross_px: float = field(init=False)
-    kill_px: list = field(init=False)
+    event_px: list = field(init=False)
+    kills: int = field(init=False)
     end_px: float = field(init=False)
 
     def __post_init__(self):
@@ -320,16 +327,20 @@ class FmtAnimInfo:
             cells_to_frontier = front - f
         self.frontier_cross_px = cells_to_frontier * CELL
 
-        self.kill_px = [self.frontier_cross_px + 2*(k+1)*CELL
-                        for k in range(self.kills)]
+        self.kills = sum(1 for kind, _ in self.events if kind == "kill")
+        px = self.frontier_cross_px
+        self.event_px = []
+        for kind, _ in self.events:
+            px += CELL if kind == "hole" else 2 * CELL
+            self.event_px.append(px)
 
         power = len(self.initial_cols) - 2
         has_remaining_soldiers = self.kills < power
 
         if self.blocked_by is not None or (self.breakthrough and has_remaining_soldiers):
-            self.end_px = self.frontier_cross_px + 2*(self.kills+1)*CELL
-        elif self.kills > 0:
-            self.end_px = self.kill_px[-1]
+            self.end_px = px + 2 * CELL
+        elif self.event_px:
+            self.end_px = self.event_px[-1]
         else:
             self.end_px = self.frontier_cross_px
 
@@ -341,14 +352,10 @@ class FmtAnimInfo:
         if slide_px < self.frontier_cross_px:
             return n
         removed = 2
-        for px in self.kill_px:
-            if slide_px >= px:
+        for px, (kind, _) in zip(self.event_px, self.events):
+            if kind == "kill" and slide_px >= px:
                 removed += 1
         return max(0, n - removed)
-
-    def defender_kills_at(self, slide_px: float) -> list:
-        return [col for px, col in zip(self.kill_px, self.killed_def_cols)
-                if slide_px >= px]
 
 
 # ---------------------------------------------------------------------------
@@ -423,18 +430,19 @@ def build_combat_plan(bs: BoardState, attacker_is_left: bool,
 
     atk_removed: set = set(fmt_cell_set)
     def_removed: set = set()
+    flank_holes: set = set()    # flank-killed cells whose tiles stay defender's
 
     for idx, af in enumerate(atk_fmts_sorted):
         r = af.row
         power             = af.power
         frontier_at_start = sim_frontier[r]
-        f0                = frontier_at_start
         remaining_power   = power
-        killed_def_cols: list = []
+        events: list = []
         blocked_by: Optional[int] = None
         breakthrough = False
 
-        # --- Main row: forward march, one kill per soldier (captures col f+k) ---
+        # --- Main row: forward march. Killing a defender costs a soldier;
+        #     tiles already emptied by an earlier flank are claimed for free.
         while remaining_power > 0:
             if attacker_is_left:
                 next_def_col = sim_frontier[r] + 1
@@ -448,55 +456,60 @@ def build_combat_plan(bs: BoardState, attacker_is_left: bool,
                 break
 
             cell = (r, next_def_col)
+            if cell in def_removed:
+                events.append(("hole", next_def_col))
+                sim_frontier[r] += 1 if attacker_is_left else -1
+                continue
             if cell in cell_to_dfid:
                 did = cell_to_dfid[cell]
                 hit_def_ids.add(did)
                 blocked_by = did
                 break
-            else:
-                killed_def_cols.append(next_def_col)
-                def_removed.add(cell)
-                sim_frontier[r] += 1 if attacker_is_left else -1
-                remaining_power -= 1
+            events.append(("kill", next_def_col))
+            def_removed.add(cell)
+            sim_frontier[r] += 1 if attacker_is_left else -1
+            remaining_power -= 1
 
-        kills = len(killed_def_cols)
+        kill_cols = [col for kind, col in events if kind == "kill"]
+        kills = len(kill_cols)
 
-        # --- Triangle: each forward soldier also captures up/down tiles, so the
-        #     captured region tapers from a wide base (col f+1) to a point. Row
-        #     r+s reaches forward (power-|s|) cols, capped by the kills actually
-        #     made (tip truncated if blocked). Stops before defense formations
-        #     and the board edge; off-board / already-owned tiles are skipped.
-        vert_captures: list = [[] for _ in range(kills)]
-        if not breakthrough and kills > 0:
-            for s in range(-(power - 1), power):
-                if s == 0:
-                    continue                      # main row handled above
-                rr = r + s
-                if not (0 <= rr < GRID_ROWS):
-                    continue
-                ext = min(power - abs(s), kills)
-                if ext <= 0:
-                    continue
-                cur = sim_frontier[rr]
-                for _ in range(ext):
-                    if attacker_is_left:
-                        ncol = cur + 1
-                        if ncol >= GRID_COLS:
-                            break
+        # --- Flanking cascade: each forward kill after the first extends the
+        #     cascade one row further out on every earlier kill column, so
+        #     after K kills column j has killed defenders out to K-j rows
+        #     above and below. Flanked defenders die but their tiles stay
+        #     defender-owned until after all attacks. The cascade stops in a
+        #     direction when it meets anything that is not a living defender;
+        #     hitting a defense formation also stops it, but counts as a hit
+        #     (weakened now, destroyed at cleanup).
+        flank_cells: list = [[] for _ in range(kills)]
+        flank_dfids: list = [[] for _ in range(kills)]
+        stopped: dict = {}
+        for m in range(1, kills):          # 0-based index of the trigger kill
+            for j in range(m):             # earlier kill columns
+                s = m - j                  # cascade distance at this moment
+                cc = kill_cols[j]
+                for d in (1, -1):
+                    if stopped.get((j, d)):
+                        continue
+                    rr = r + d * s
+                    if 0 <= rr < GRID_ROWS:
+                        is_def = cc > sim_frontier[rr] if attacker_is_left \
+                            else cc <= sim_frontier[rr]
                     else:
-                        ncol = cur
-                        if ncol < 0:
-                            break
-                    vcell = (rr, ncol)
-                    if vcell in cell_to_dfid:      # defense formation blocks
-                        break
-                    # animation step: outer/farther-forward tiles fall later
-                    m = abs(ncol - f0)
-                    k = min(kills - 1, max(0, m + abs(s) - 1))
-                    vert_captures[k].append(vcell)
+                        is_def = False
+                    vcell = (rr, cc)
+                    if is_def and vcell in cell_to_dfid:
+                        did = cell_to_dfid[vcell]
+                        hit_def_ids.add(did)
+                        flank_dfids[m].append(did)
+                        stopped[(j, d)] = True
+                        continue
+                    if not is_def or vcell in def_removed:
+                        stopped[(j, d)] = True
+                        continue
+                    flank_cells[m].append(vcell)
                     def_removed.add(vcell)
-                    cur = ncol if attacker_is_left else ncol - 1
-                sim_frontier[rr] = cur
+                    flank_holes.add(vcell)
 
         if breakthrough:
             row_breakthrough_count[r] = row_breakthrough_count.get(r, 0) + 1
@@ -506,19 +519,33 @@ def build_combat_plan(bs: BoardState, attacker_is_left: bool,
             initial_cols=af.cols[:],
             attacker_is_left=attacker_is_left,
             frontier_at_start=frontier_at_start,
-            kills=kills,
-            killed_def_cols=killed_def_cols,
+            events=events,
             blocked_by=blocked_by,
             breakthrough=breakthrough,
-            vert_captures=vert_captures,
+            flank_cells=flank_cells,
+            flank_dfids=flank_dfids,
         ))
+
+    # --- Flank holes left unclaimed after all attacks: the defenders in those
+    #     rows fall back to fill the gaps, and the freed tiles at the front of
+    #     the row flip to the attacker.
+    flank_rows: dict = {}
+    for (rr, cc) in flank_holes:
+        still_def = cc > sim_frontier[rr] if attacker_is_left \
+            else cc <= sim_frontier[rr]
+        if still_def:
+            flank_rows[rr] = flank_rows.get(rr, 0) + 1
+    for rr, h in flank_rows.items():
+        sim_frontier[rr] += h if attacker_is_left else -h
 
     # --- Breakthrough reclaim: the defender re-takes a triangle of tiles
     #     centered on the hit row. Each row is brought UP TO a target depth
-    #     (3 tiles in the hit row, 2 in rows ±1, 1 in rows ±2) — i.e. the
-    #     defender ends up owning max(target, what it already owns) tiles in
-    #     that row. Rows it already holds deeply are left untouched. ---
-    RECLAIM_TRIANGLE = ((0, 3), (1, 2), (-1, 2), (2, 1), (-2, 1))
+    #     (4 tiles in the hit row, decreasing by one per row of distance:
+    #     3 in rows ±1, 2 in rows ±2, 1 in rows ±3) — i.e. the defender ends
+    #     up owning max(target, what it already owns) tiles in that row.
+    #     Rows it already holds deeply are left untouched. ---
+    RECLAIM_TRIANGLE = ((0, 4), (1, 3), (-1, 3), (2, 2), (-2, 2),
+                        (3, 1), (-3, 1))
     for r, count in row_breakthrough_count.items():
         for _ in range(count):
             breakthrough_rows.append(r)
@@ -623,7 +650,26 @@ def build_combat_plan(bs: BoardState, attacker_is_left: bool,
         survivors = [c for c in orig_def_region
                      if (r, c) not in def_removed and c in region]
 
-        if defender_is_left:
+        if r in flank_rows:
+            # flanked row: defenders fall back toward their own edge to fill
+            # the gaps (units in front of a hole retreat out of the ceded
+            # tiles, so don't filter by the final region); any spawns man
+            # what is left of the front
+            survivors = [c for c in orig_def_region
+                         if (r, c) not in def_removed]
+            if defender_is_left:
+                new_pos = list(range(0, len(survivors)))
+                spawn_cols = range(len(survivors), f + 1)
+            else:
+                new_pos = list(range(GRID_COLS - len(survivors), GRID_COLS))
+                spawn_cols = range(f + 1, GRID_COLS - len(survivors))
+            for old_c, new_c in zip(survivors, new_pos):
+                def_slide_map[(r, old_c)] = (r, new_c)
+                final.board[r][new_c] = orig.board[r][old_c]
+            for c in spawn_cols:
+                final.board[r][c] = random.randrange(NUM_COLORS)
+                def_spawn_cells.append((r, c))
+        elif defender_is_left:
             new_pos = list(range(f - len(survivors) + 1, f + 1))
             for old_c, new_c in zip(reversed(survivors), reversed(new_pos)):
                 def_slide_map[(r, old_c)] = (r, new_c)
@@ -728,13 +774,6 @@ class AnimState:
         else:
             self.vis_frontier[r] -= kills_delta
 
-    def _set_capture_frontier(self, r, captured_col):
-        """Extend a row's visible frontier to include a just-captured tile."""
-        if self.plan.attacker_is_left:
-            self.vis_frontier[r] = max(self.vis_frontier[r], captured_col)
-        else:
-            self.vis_frontier[r] = min(self.vis_frontier[r], captured_col - 1)
-
     def _trigger_fmt_events(self, fai: FmtAnimInfo, old_px: float, new_px: float):
         r = fai.row
         d = 1 if fai.attacker_is_left else -1
@@ -746,19 +785,27 @@ class AnimState:
             for c in fai.initial_cols[:2]:
                 self.kill_cell(r, c, _slid_cx(c, fai.frontier_cross_px))
 
-        for k, (px, def_col) in enumerate(zip(fai.kill_px, fai.killed_def_cols)):
+        kill_i = 0
+        for px, (kind, def_col) in zip(fai.event_px, fai.events):
+            if kind == "hole":
+                # marching through a tile an earlier flank emptied: claim it
+                if old_px < px <= new_px:
+                    self._advance_frontier(r, 1)
+                continue
             if old_px < px <= new_px:
-                soldier_idx = 2 + k
+                soldier_idx = 2 + kill_i
                 if soldier_idx < len(fai.initial_cols):
                     atk_c = fai.initial_cols[soldier_idx]
                     self.kill_cell(r, atk_c, _slid_cx(atk_c, px))
                 self.kill_cell(r, def_col)
                 self._advance_frontier(r, 1)
-                # This soldier also sweeps the triangle's up/down tiles.
-                if k < len(fai.vert_captures):
-                    for (vr, vc) in fai.vert_captures[k]:
-                        self.kill_cell(vr, vc)
-                        self._set_capture_frontier(vr, vc)
+                # the flanking cascade fires the moment this kill lands;
+                # flanked defenders die but their tiles stay defender-owned
+                for (vr, vc) in fai.flank_cells[kill_i]:
+                    self.kill_cell(vr, vc)
+                for did in fai.flank_dfids[kill_i]:
+                    self.red_def_ids.add(did)
+            kill_i += 1
 
         if fai.blocked_by is not None:
             if old_px < fai.end_px <= new_px:
