@@ -21,6 +21,8 @@ Sprites are loaded from assets/sprites.png (regenerate with gen_sprites.py).
 Run:  python3 mage_grid.py
 """
 
+import itertools
+import json
 import os
 import pygame
 import sys
@@ -54,7 +56,7 @@ FPS = 60
 ELEM_NAMES = ["Water", "Fire", "Lightning", "Nature", "Rock"]
 ELEM_KEYS  = ["W",     "F",    "L",         "N",      "R"]
 NUM_COLORS = 5
-HP_MAX     = 10
+HP_MAX     = 5
 
 UNIT_RGB = {
     0: (90,  150, 255),   # Blue   — water
@@ -82,6 +84,7 @@ C_FRONTIER   = (255, 255, 255)
 #   19-21 force field (front on the right; mirrored for right defenders)
 #   22-24 weakened field (same facing rule)
 #   25-28 ball f0-f3 (mirrored for right attackers so rolling reads right)
+#   29-30 left scared s0-s1     31-32 right scared s0-s1
 # ---------------------------------------------------------------------------
 
 SHEET_TILE = 24
@@ -129,6 +132,8 @@ def load_sprites():
                       "right": [tile(c, ci, True) for c in range(22, 25)]},
             "ball":  {"left":  [tile(c, ci) for c in range(25, 29)],
                       "right": [tile(c, ci, True) for c in range(25, 29)]},
+            "scared": {"left":  [tile(c, ci) for c in range(29, 31)],
+                       "right": [tile(c, ci) for c in range(31, 33)]},
         }
 
 
@@ -203,10 +208,20 @@ class BoardState:
         return c <= self.frontier[r]
 
 
-def make_board():
+# The first attacker has a measurable edge (~56% in AI-vs-AI testing), so
+# the first DEFENDER starts one tile deeper in the two rows flanking the
+# middle (rows 4 and 6, counting 1-9). Self-play shows this evens the match
+# to ~49/51.
+HANDICAP_ROWS = (3, 5)
+
+
+def make_board(first_attacker_is_left=True):
     board = [[random.randrange(NUM_COLORS) for _ in range(GRID_COLS)]
              for _ in range(GRID_ROWS)]
-    return BoardState(board=board, frontier=[STARTING_FRONTIER] * GRID_ROWS)
+    frontier = [STARTING_FRONTIER] * GRID_ROWS
+    for r in HANDICAP_ROWS:
+        frontier[r] = STARTING_FRONTIER + (-1 if first_attacker_is_left else 1)
+    return BoardState(board=board, frontier=frontier)
 
 
 # ---------------------------------------------------------------------------
@@ -710,6 +725,110 @@ def build_combat_plan(bs: BoardState, attacker_is_left: bool,
 
 
 # ---------------------------------------------------------------------------
+# Computer player
+# ---------------------------------------------------------------------------
+# The AI evaluates every possible element pair by simulating the turn with
+# the real combat engine (build_combat_plan) and scoring the outcome with a
+# small weight vector. The weights ship in assets/ai_weights.json, produced
+# by offline self-play training (train_ai.py); built-in defaults are used if
+# the file is missing. Everything runs locally — no network.
+#
+# Difficulty is deliberately "medium": instead of always playing its best
+# move, the AI picks from its top moves with fixed probabilities.
+# ---------------------------------------------------------------------------
+
+ALL_COMBOS = list(itertools.combinations(range(NUM_COLORS), 2))
+
+AI_WEIGHTS = {
+    "tiles": 1.0,    # net territory gained
+    "hp":    6.0,    # breakthrough damage to the enemy player
+    "kill":  0.35,   # defenders killed
+    "loss":  0.25,   # own soldiers spent
+    "fmt":   0.6,    # enemy defense formations destroyed
+}
+
+
+def load_ai_weights():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "assets", "ai_weights.json")
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        AI_WEIGHTS.update({k: float(v) for k, v in data.items()
+                           if k in AI_WEIGHTS})
+    except (OSError, ValueError):
+        pass
+
+
+def plan_score(plan, orig_bs, attacker_is_left, w=None):
+    """Score a simulated turn from the ATTACKER's point of view."""
+    w = w or AI_WEIGHTS
+    sign = 1 if attacker_is_left else -1
+    tiles = sum((plan.final_board.frontier[r] - orig_bs.frontier[r]) * sign
+                for r in range(GRID_ROWS))
+    if attacker_is_left:
+        hp_dmg = orig_bs.hp_right - plan.final_board.hp_right
+    else:
+        hp_dmg = orig_bs.hp_left - plan.final_board.hp_left
+    def_killed = sum(f.kills + sum(len(fc) for fc in f.flank_cells)
+                     for f in plan.fmt_anim)
+    def_killed += sum(len(plan.defense_map[d].cells)
+                      for d in plan.hit_def_ids)
+    atk_lost = sum(len(af.cols) for af in plan.attack_formations)
+    return (w["tiles"] * tiles + w["hp"] * hp_dmg + w["kill"] * def_killed
+            - w["loss"] * atk_lost + w["fmt"] * len(plan.hit_def_ids))
+
+
+def _pick_tempered(scored, rng, temper):
+    """scored: [(score, combo)]. Medium difficulty: usually the best move,
+    regularly the 2nd or 3rd, occasionally something else."""
+    scored.sort(key=lambda s: -s[0])
+    if not temper or len(scored) < 3:
+        return scored[0][1]
+    r = rng.random()
+    if r < 0.55:
+        return scored[0][1]
+    if r < 0.80:
+        return scored[1][1]
+    if r < 0.95:
+        return scored[2][1]
+    return scored[rng.randrange(len(scored))][1]
+
+
+def ai_choose_attack(bs, attacker_is_left, weights=None, rng=random,
+                     temper=True, sample_defs=None):
+    """Pick attack elements: each pair is judged by its average outcome over
+    the defenses the opponent might choose (unknown at attack time)."""
+    defs = ALL_COMBOS if sample_defs is None \
+        else rng.sample(ALL_COMBOS, sample_defs)
+    scored = []
+    for atk in ALL_COMBOS:
+        tot = 0.0
+        for dfn in defs:
+            plan = build_combat_plan(bs.copy(), attacker_is_left, atk, dfn)
+            tot += plan_score(plan, bs, attacker_is_left, weights)
+        scored.append((tot / len(defs), atk))
+    return _pick_tempered(scored, rng, temper)
+
+
+def ai_choose_defense(bs, attacker_is_left, weights=None, rng=random,
+                      temper=True, sample_atks=None):
+    """Pick defense elements BLIND — the defender never sees the attack, so
+    each pair is judged by its average outcome over the attacks the
+    opponent might have chosen."""
+    atks = ALL_COMBOS if sample_atks is None \
+        else rng.sample(ALL_COMBOS, sample_atks)
+    scored = []
+    for dfn in ALL_COMBOS:
+        tot = 0.0
+        for atk in atks:
+            plan = build_combat_plan(bs.copy(), attacker_is_left, atk, dfn)
+            tot -= plan_score(plan, bs, attacker_is_left, weights)
+        scored.append((tot / len(atks), dfn))
+    return _pick_tempered(scored, rng, temper)
+
+
+# ---------------------------------------------------------------------------
 # Animation state machine
 # ---------------------------------------------------------------------------
 
@@ -720,6 +839,7 @@ class Phase(Enum):
     RECLAIM       = auto()
     SLIDE_FILL    = auto()
     SPAWN         = auto()
+    VICTORY       = auto()
     DONE          = auto()
 
 # Durations (seconds)
@@ -743,6 +863,15 @@ class AnimState:
         # (r,c) -> (total_t, death_cx) — x position where the unit died
         self.dying: dict = {}
         self.vis_frontier: list = orig_board.frontier[:]
+        # live HP shown during the animation: drops the moment a
+        # breakthrough lands (with the red flash), not at the end
+        self.hp_left: int = orig_board.hp_left
+        self.hp_right: int = orig_board.hp_right
+        # set when a breakthrough brings a player to 0 HP: the match ends
+        # right away (after a short beat for the flash) — remaining attacks
+        # and the wind-down phases are skipped in favor of the victory sweep
+        self.match_over_at: Optional[float] = None
+        self.victory: Optional[dict] = None
 
         self.non_fmt_alpha: float = 255.0
         self.def_outline_alpha: float = 0.0
@@ -819,6 +948,14 @@ class AnimState:
                 for c in fai.initial_cols:
                     self.kill_cell(r, c, _slid_cx(c, fai.end_px))
                 self.flash_alpha = 220.0
+                # the defender loses the hit point right now
+                if self.plan.attacker_is_left:
+                    self.hp_right -= 1
+                else:
+                    self.hp_left -= 1
+                if min(self.hp_left, self.hp_right) <= 0 and \
+                        self.match_over_at is None:
+                    self.match_over_at = self.total_t + 0.7
 
 
 # ---------------------------------------------------------------------------
@@ -831,6 +968,21 @@ def advance_anim(state: AnimState, dt: float) -> bool:
 
     if state.flash_alpha > 0:
         state.flash_alpha = max(0.0, state.flash_alpha - dt * 280)
+
+    # a killing blow ends the match on the spot: freeze the state machine
+    # (the flash and death bursts still play out) for a beat, then run the
+    # victory sweep — the loser's army explodes and the winner floods in
+    if state.match_over_at is not None and state.phase != Phase.VICTORY:
+        if state.total_t >= state.match_over_at:
+            _start_victory(state)
+        else:
+            return False
+
+    if state.phase == Phase.VICTORY:
+        state.t += dt
+        if state.t >= VICTORY_DUR:
+            state.phase = Phase.DONE
+        return state.phase == Phase.DONE
 
     if state.phase == Phase.FADE_SETUP:
         state.t += dt
@@ -950,6 +1102,117 @@ def _start_spawn(state: AnimState):
     state.spawn_alpha = 0.0
 
 
+# Victory sweep timeline (seconds within Phase.VICTORY):
+#   0.0-1.1  the loser's remaining troops panic and explode in a wave
+#            rolling from their front line to their back edge
+#   1.1-2.0  the winner's troops march forward to occupy the whole board
+#   2.0-2.6  reinforcements fade in behind them
+VICT_MARCH0 = 1.1
+VICT_MARCH1 = 2.0
+VICT_SPAWN0 = 2.0
+VICT_SPAWN1 = 2.6
+VICTORY_DUR = 2.8
+
+
+def _start_victory(state: AnimState):
+    """The defender just died: schedule their army's explosions, and plan
+    the winner's board-wide advance. Also rewrites plan.final_board so the
+    game-over backdrop shows the occupied board."""
+    plan, orig = state.plan, state.orig
+    atk_left = plan.attacker_is_left
+    final = plan.final_board
+    explode: dict = {}
+    moves: list = []
+    spawns: list = []
+
+    for r in range(GRID_ROWS):
+        f = state.vis_frontier[r]
+        # surviving defenders: explosion wave front-to-back
+        def_cols = range(f + 1, GRID_COLS) if atk_left else range(0, f + 1)
+        front = f + 1 if atk_left else f
+        for c in def_cols:
+            if (r, c) in state.dead:
+                continue
+            dist = (c - front) if atk_left else (front - c)
+            jitter = ((r * 7 + c * 13) % 4) * 0.05
+            explode[(r, c)] = 0.1 + dist * 0.09 + jitter
+
+        # surviving attackers pack against the defender's back edge
+        atk_cols = range(0, f + 1) if atk_left else range(f + 1, GRID_COLS)
+        alive = [c for c in atk_cols if (r, c) not in state.dead]
+        n = len(alive)
+        targets = list(range(GRID_COLS - n, GRID_COLS)) if atk_left \
+            else list(range(0, n))
+        spawn_cols = range(0, GRID_COLS - n) if atk_left \
+            else range(n, GRID_COLS)
+        for c_from, c_to in zip(alive, targets):
+            ci = orig.board[r][c_from]
+            moves.append((r, c_from, c_to, ci))
+            final.board[r][c_to] = ci
+        for c in spawn_cols:
+            ci = random.randrange(NUM_COLORS)
+            spawns.append((r, c, ci))
+            final.board[r][c] = ci
+        final.frontier[r] = GRID_COLS - 1 if atk_left else -1
+
+    state.victory = {"explode": explode, "moves": moves, "spawns": spawns,
+                     "start_frontier": state.vis_frontier[:]}
+    state.phase = Phase.VICTORY
+    state.t = 0.0
+
+
+def _draw_victory(surf, state: AnimState, anim_t=0.0):
+    plan = state.plan
+    orig = state.orig
+    v = state.victory
+    t = state.t
+    atk_left = plan.attacker_is_left
+    atk_side = "left" if atk_left else "right"
+    def_side = "right" if atk_left else "left"
+
+    # territory floods forward with the march
+    p = 0.0 if t <= VICT_MARCH0 else \
+        min(1.0, (t - VICT_MARCH0) / (VICT_MARCH1 - VICT_MARCH0))
+    full = GRID_COLS - 1 if atk_left else -1
+    frontier = [int(round(s + (full - s) * p))
+                for s in v["start_frontier"]]
+    draw_bg(surf, frontier)
+
+    # the doomed army panics, then explodes in a wave
+    scared_f = int(state.total_t / 0.12) % 2
+    for (r, c), te in v["explode"].items():
+        ci = orig.board[r][c]
+        if t < te:
+            x, y = cell_xy(r, c)
+            draw_mage(surf, ci, def_side, x, y,
+                      pose="scared", pose_frame=scared_f)
+        elif t - te < DEATH_DUR:
+            draw_death_burst(surf, ci, c * CELL + CELL // 2,
+                             r * CELL + GRID_Y + CELL // 2, t - te)
+
+    # the winners march in...
+    alpha = int(min(255, 255 * t / 0.4))
+    for (r, c0, c1, ci) in v["moves"]:
+        px = int((c0 + (c1 - c0) * p) * CELL)
+        draw_mage(surf, ci, atk_side, px, r * CELL + GRID_Y, alpha, anim_t)
+
+    # ...and their reinforcements appear behind them
+    if t >= VICT_SPAWN0:
+        sa = int(min(255, 255 * (t - VICT_SPAWN0)
+                     / (VICT_SPAWN1 - VICT_SPAWN0)))
+        for (r, c, ci) in v["spawns"]:
+            x, y = cell_xy(r, c)
+            draw_mage(surf, ci, atk_side, x, y, sa, anim_t)
+
+    draw_frontier_dots(surf, frontier)
+    draw_grid(surf)
+
+    if state.flash_alpha > 0:
+        ov = pygame.Surface((GRID_COLS * CELL, GRID_ROWS * CELL), pygame.SRCALPHA)
+        ov.fill((255, 0, 0, int(min(state.flash_alpha, 160))))
+        surf.blit(ov, (0, GRID_Y))
+
+
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
@@ -1021,11 +1284,47 @@ def draw_static(surf, bs: BoardState, active_left=None, anim_t=0.0, glow=None):
     draw_grid(surf)
 
 
+def compute_scared_cells(state: AnimState):
+    """Defenders about to die panic once their killer is one tile away:
+    the kill target in the marching row, and the flank victims whose
+    cascade fires on that same kill. A breakthrough's red flash panics the
+    entire defending army for as long as the screen flashes."""
+    plan = state.plan
+    scared = set()
+
+    if state.flash_alpha > 0:
+        atk_left = plan.attacker_is_left
+        for r in range(GRID_ROWS):
+            f = state.vis_frontier[r]
+            cols = range(f + 1, GRID_COLS) if atk_left else range(0, f + 1)
+            for c in cols:
+                if (r, c) not in state.dead:
+                    scared.add((r, c))
+
+    if state.phase != Phase.FMT_SLIDE or state.fmt_tf_t < TRANSFORM_DUR or \
+            state.cur_fmt_idx >= len(plan.fmt_anim):
+        return scared
+    fai = plan.fmt_anim[state.cur_fmt_idx]
+    kill_i = 0
+    for px, (kind, col) in zip(fai.event_px, fai.events):
+        if kind != "kill":
+            continue
+        if px - CELL <= state.cur_slide_px < px:
+            scared.add((fai.row, col))
+            scared.update(fai.flank_cells[kill_i])
+        kill_i += 1
+    return scared
+
+
 def draw_animated(surf, state: AnimState, anim_t=0.0):
     plan  = state.plan
     orig  = state.orig
     final = plan.final_board
     phase = state.phase
+
+    if phase == Phase.VICTORY:
+        _draw_victory(surf, state, anim_t)
+        return
 
     atk_left  = plan.attacker_is_left
     atk_side  = "left" if atk_left else "right"
@@ -1036,6 +1335,8 @@ def draw_animated(surf, state: AnimState, anim_t=0.0):
     cast_f  = min(2, int(state.total_t / CAST_FRAME_S))
     tired_f = int(state.total_t / TIRED_FRAME_S) % 2
     field_f = int(state.total_t / FIELD_FRAME_S) % 3
+    scared_f = int(state.total_t / 0.12) % 2
+    scared_cells = compute_scared_cells(state)
 
     draw_bg(surf, state.vis_frontier)
 
@@ -1070,6 +1371,13 @@ def draw_animated(surf, state: AnimState, anim_t=0.0):
                     if age < DEATH_DUR:
                         death_cy = r * CELL + GRID_Y + CELL // 2
                         draw_death_burst(surf, ci, death_cx, death_cy, age)
+                continue
+
+            # Doomed defenders panic as their killer closes in
+            if cell in scared_cells:
+                x, y = cell_xy(r, c)
+                draw_mage(surf, ci, def_side, x, y,
+                          pose="scared", pose_frame=scared_f)
                 continue
 
             # Non-formation attackers (fade out phase 1, fade in phase 5)
@@ -1158,17 +1466,20 @@ def draw_animated(surf, state: AnimState, anim_t=0.0):
                     draw_mage(surf, ci, side, x, y, 255, anim_t)
                 continue
 
-            # Defender slide-fill cells
+            # Defender slide-fill cells — a retreating defender is still a
+            # defender: keep its own colors and keep it facing the enemy
+            # while it slides backward, even if its old tile now belongs to
+            # the attacker.
             if cell in plan.def_slide_map:
                 nr, nc = plan.def_slide_map[cell]
                 if phase == Phase.SLIDE_FILL:
                     tp = state.slide_progress
                     px = int((c + (nc - c) * tp) * CELL)
-                    draw_mage(surf, ci, side_of(r, c, final), px,
+                    draw_mage(surf, ci, def_side, px,
                               r * CELL + GRID_Y, 255, anim_t)
                 elif phase in (Phase.SPAWN, Phase.DONE):
                     x, y = cell_xy(nr, nc)
-                    draw_mage(surf, ci, side_of(nr, nc, final), x, y, 255, anim_t)
+                    draw_mage(surf, ci, def_side, x, y, 255, anim_t)
                 else:
                     x, y = cell_xy(r, c)
                     draw_mage(surf, ci, side, x, y, 255, anim_t)
@@ -1299,6 +1610,13 @@ class SelectionGlow:
 # HUD / Sidebar
 # ---------------------------------------------------------------------------
 
+# who is controlled by the computer — chosen on the name-entry screen and
+# locked in for the whole match
+CPU_PLAYERS = {"left": False, "right": False}
+AI_STEP_S   = 0.55    # seconds between the AI revealing each element pick
+AI_SUBMIT_S = 1.8     # seconds until the AI confirms its picks
+
+
 def draw_hud(surf, fonts, atk_is_left, turn):
     font, bfont, _ = fonts
     pygame.draw.rect(surf, BG_HUD, (0, 0, SCREEN_W, HUD_H))
@@ -1358,7 +1676,9 @@ def draw_sidebar(surf, fonts, sx, gs, pick_info=None):
             f"{pick_info['who']}  —  {pick_info['role']}",
             True, pick_info["role_color"])
         surf.blit(lbl, (sx + 8, y)); y += lbl.get_height() + 4
-        inst = font.render("Pick 2 elements, then Enter", True, (140, 140, 135))
+        inst_txt = "Choosing elements..." if pick_info.get("cpu") \
+            else "Pick 2 elements, then Enter"
+        inst = font.render(inst_txt, True, (140, 140, 135))
         surf.blit(inst, (sx + 8, y)); y += inst.get_height() + 4
 
         if pick_info.get("confirm_msg") and pick_info.get("confirm_timer", 0) > 0:
@@ -1476,6 +1796,195 @@ class ElementPicker:
 
 
 # ---------------------------------------------------------------------------
+# Tutorial
+# ---------------------------------------------------------------------------
+# A scripted match vs the "Tutor" (2 HP). Each lesson RESETS the board to a
+# fixed layout, so the setup is identical every run: a checkerboard of
+# Lightning/Rock (which can never form a run for any other element pair)
+# with the lesson's formation cells painted on top. The player is told what
+# to pick, the relevant cells pulse, and the Tutor's picks are scripted.
+# After the last lesson the match continues as a normal game vs the AI.
+# ---------------------------------------------------------------------------
+
+TUTORIAL_STEPS = [
+    {   # 1 — attack basics: one 3-unit formation, undefended
+        "attacker_left": True,
+        "player_pick": (0, 1), "cpu_pick": (0, 3),
+        "cells": [(4, 2, 0), (4, 3, 1), (4, 4, 0)],
+        "highlight": [(4, 2), (4, 3), (4, 4)],
+        "lines": ["ATTACK BASICS",
+                  "Pick 2 elements. Any 3+",
+                  "of them side by side in",
+                  "a row of your land form",
+                  "an attack formation.",
+                  "",
+                  "Pick WATER + FIRE and",
+                  "press Enter. The marked",
+                  "three will charge: the",
+                  "front two fall crossing",
+                  "the border, each soldier",
+                  "behind kills 1 defender."],
+    },
+    {   # 2 — defense basics: block a known attack
+        "attacker_left": False,
+        "player_pick": (1, 3), "cpu_pick": (0, 1),
+        "cells": [(2, 4, 3), (3, 4, 1), (4, 4, 3),
+                  (3, 5, 1), (3, 6, 0), (3, 7, 1)],
+        "highlight": [(2, 4), (3, 4), (4, 4)],
+        "lines": ["DEFENSE BASICS",
+                  "The Tutor attacks with",
+                  "WATER + FIRE: its squad",
+                  "in row 3 will charge",
+                  "your column 4.",
+                  "",
+                  "3+ of your elements",
+                  "stacked in a COLUMN",
+                  "raise a force-field",
+                  "wall. Pick FIRE +",
+                  "NATURE to wall off the",
+                  "marked cells."],
+    },
+    {   # 3 — two attack formations at once
+        "attacker_left": True,
+        "player_pick": (0, 3), "cpu_pick": (1, 2),
+        "cells": [(2, 2, 0), (2, 3, 3), (2, 4, 0),
+                  (6, 2, 3), (6, 3, 0), (6, 4, 3)],
+        "highlight": [(2, 2), (2, 3), (2, 4), (6, 2), (6, 3), (6, 4)],
+        "lines": ["MULTIPLE FORMATIONS",
+                  "One pick can launch",
+                  "several squads at once.",
+                  "",
+                  "Pick WATER + NATURE:",
+                  "the squads in rows 2",
+                  "and 6 both charge, top",
+                  "row first."],
+    },
+    {   # 4 — one tall wall blocks two attacks
+        "attacker_left": False,
+        "player_pick": (0, 1), "cpu_pick": (0, 3),
+        "cells": [(1, 4, 0), (2, 4, 1), (3, 4, 0), (4, 4, 1), (5, 4, 0),
+                  (1, 5, 0), (1, 6, 3), (1, 7, 0),
+                  (5, 5, 3), (5, 6, 0), (5, 7, 3)],
+        "highlight": [(1, 4), (2, 4), (3, 4), (4, 4), (5, 4)],
+        "lines": ["BIG WALLS",
+                  "Two enemy squads are",
+                  "coming, in rows 1 and 5.",
+                  "One tall wall can block",
+                  "them both.",
+                  "",
+                  "Pick WATER + FIRE to",
+                  "raise a 5-unit wall in",
+                  "column 4. It weakens on",
+                  "the first hit and",
+                  "crumbles when the",
+                  "attack ends."],
+    },
+    {   # 5 — flanking cascade
+        "attacker_left": True,
+        "player_pick": (1, 3), "cpu_pick": (0, 2),
+        "cells": [(4, 0, 1), (4, 1, 3), (4, 2, 1), (4, 3, 3), (4, 4, 1)],
+        "highlight": [(4, 0), (4, 1), (4, 2), (4, 3), (4, 4)],
+        "lines": ["FLANKING",
+                  "Bigger squads cut deeper.",
+                  "Pick FIRE + NATURE: five",
+                  "soldiers make 3 kills",
+                  "ahead - and the cascade",
+                  "also cuts down defenders",
+                  "above and below the",
+                  "earlier kills. Survivors",
+                  "fall back to plug the",
+                  "holes, and you claim the",
+                  "freed ground after the",
+                  "battle."],
+    },
+    {   # 6 — an early block stops the whole cascade
+        "attacker_left": False,
+        "player_pick": (0, 4), "cpu_pick": (1, 3),
+        "cells": [(3, 4, 0), (4, 4, 4), (5, 4, 0),
+                  (4, 5, 1), (4, 6, 3), (4, 7, 1), (4, 8, 3), (4, 9, 1)],
+        "highlight": [(3, 4), (4, 4), (5, 4)],
+        "lines": ["STOP THE CASCADE",
+                  "A 5-soldier squad is",
+                  "charging along row 4!",
+                  "Flanking only grows",
+                  "while a squad advances:",
+                  "block its FIRST step and",
+                  "nothing else happens.",
+                  "",
+                  "Pick WATER + ROCK for a",
+                  "wall in column 4."],
+    },
+    {   # 7 — breakthrough: hit the back line
+        "attacker_left": True,
+        "player_pick": (0, 1), "cpu_pick": (0, 3),
+        "frontier": [4, 4, 4, 4, 8, 4, 4, 4, 4],
+        "cells": [(4, 5, 0), (4, 6, 1), (4, 7, 0), (4, 8, 1)],
+        "highlight": [(4, 5), (4, 6), (4, 7), (4, 8)],
+        "lines": ["BREAKTHROUGH",
+                  "Reach the enemy's back",
+                  "line and they lose 1 HP.",
+                  "Your squad in row 4 is",
+                  "already deep in their",
+                  "land: pick WATER + FIRE,",
+                  "kill the last defender",
+                  "and charge off the board.",
+                  "The enemy claws back a",
+                  "wedge of ground after.",
+                  "The Tutor has 2 HP -",
+                  "one more hit wins!"],
+    },
+]
+
+TUTORIAL_FREE_LINES = [
+    "TUTORIAL COMPLETE",
+    "Finish the match! The",
+    "Tutor plays for real",
+    "now, with 1 HP left.",
+    "",
+    "One last rule: in real",
+    "matches the first",
+    "defender starts with 2",
+    "bonus tiles as a",
+    "handicap. Good luck!",
+]
+
+
+def make_tutorial_board(step, hp_left, hp_right):
+    board = [[2 if (r + c) % 2 == 0 else 4 for c in range(GRID_COLS)]
+             for r in range(GRID_ROWS)]
+    for (r, c, ci) in step["cells"]:
+        board[r][c] = ci
+    frontier = step.get("frontier", [STARTING_FRONTIER] * GRID_ROWS)
+    return BoardState(board=board, frontier=frontier[:],
+                      hp_left=hp_left, hp_right=hp_right)
+
+
+def draw_tut_panel(surf, fonts, lines):
+    font, bfont, _ = fonts
+    sx = GRID_COLS * CELL
+    y = HUD_H + 352
+    pygame.draw.rect(surf, BG_SIDEBAR,
+                     (sx, y - 8, SIDEBAR_W, SCREEN_H - y + 8))
+    pygame.draw.line(surf, (55, 50, 44),
+                     (sx + 8, y - 8), (sx + SIDEBAR_W - 8, y - 8), 1)
+    for i, line in enumerate(lines):
+        if i == 0:
+            surf.blit(bfont.render(line, True, (255, 216, 120)), (sx + 8, y))
+            y += 24
+        else:
+            surf.blit(font.render(line, True, (200, 196, 184)), (sx + 8, y))
+            y += 18
+
+
+def draw_tut_highlights(surf, cells, t):
+    a = int(140 + 90 * math.sin(t * 4.5))
+    for (r, c) in cells:
+        s = pygame.Surface((CELL, CELL), pygame.SRCALPHA)
+        pygame.draw.rect(s, (255, 220, 90, a), (2, 2, CELL - 4, CELL - 4), 3)
+        surf.blit(s, (c * CELL, r * CELL + GRID_Y))
+
+
+# ---------------------------------------------------------------------------
 # Text input
 # ---------------------------------------------------------------------------
 
@@ -1572,6 +2081,11 @@ def main():
 
     name_step = 0
     inputs    = [TextInput("Left player name:"), TextInput("Right player name:")]
+    # per-player Human/Computer choice, made on the name screen and locked
+    # in for the whole match
+    ptype     = [CPU_PLAYERS["left"], CPU_PLAYERS["right"]]
+    type_btns = [pygame.Rect(SCREEN_W // 2 + 190, 150 + i * 90 + 14, 150, 30)
+                 for i in range(2)]
 
     picker     = ElementPicker(sx)
     glow       = SelectionGlow()
@@ -1581,6 +2095,45 @@ def main():
     confirm_msg   = ""
     confirm_timer = 0.0
     gs            = {"phase": "title"}
+    ai_choice     = None      # elements the computer decided on this pick
+    ai_timer      = 0.0
+    tut           = None      # None | {"step": i} | {"free": True}
+    tut_btn       = pygame.Rect(SCREEN_W // 2 - 75, 430, 150, 34)
+    load_ai_weights()
+
+    def do_submit():
+        """Confirm the picker's two elements (Enter key or computer turn)."""
+        nonlocal color_step, atk_colors, def_colors, confirm_msg
+        nonlocal confirm_timer, anim, phase, gs, ai_choice, ai_timer
+        if color_step == 0:
+            atk_colors = picker.get()
+            color_step = 1
+            picker.reset()
+            # never reveal the attack elements to the defender
+            confirm_msg = "Attack locked in!"
+            confirm_timer = 1.8
+        else:
+            def_colors = picker.get()
+            plan = build_combat_plan(bs, atk_is_left, atk_colors, def_colors)
+            anim = AnimState(plan, bs)
+            phase = "anim"
+            gs = {"phase": "anim",
+                  "atk_colors": atk_colors,
+                  "def_colors": def_colors}
+        ai_choice = None
+        ai_timer = 0.0
+
+    def load_tut_step(hp_l, hp_r):
+        """Reset the board to the current lesson's fixed layout."""
+        nonlocal bs, atk_is_left, phase, color_step, atk_colors, def_colors
+        nonlocal gs, ai_choice, ai_timer
+        step = TUTORIAL_STEPS[tut["step"]]
+        bs = make_tutorial_board(step, hp_l, hp_r)
+        atk_is_left = step["attacker_left"]
+        phase = "pick"; color_step = 0; picker.reset()
+        atk_colors = None; def_colors = None
+        ai_choice = None; ai_timer = 0.0
+        gs = {"phase": "pick"}
 
     while True:
         dt = clock.tick(FPS) / 1000.0
@@ -1598,46 +2151,97 @@ def main():
                     inputs[0].text = ""; inputs[1].text = ""
 
             elif phase == "name_entry":
+                if ev.type == pygame.MOUSEBUTTONDOWN:
+                    for i, rect in enumerate(type_btns):
+                        if rect.collidepoint(ev.pos):
+                            ptype[i] = not ptype[i]
+                    if tut_btn.collidepoint(ev.pos):
+                        tut = {"step": 0}
+                        CPU_PLAYERS["left"] = False
+                        CPU_PLAYERS["right"] = True
+                        left_name, right_name = "You", "Tutor (CPU)"
+                        turn = 1
+                        load_tut_step(HP_MAX, 2)
                 if ev.type == pygame.KEYDOWN:
-                    if inputs[name_step].handle(ev):
+                    if ev.key == pygame.K_TAB:
+                        ptype[name_step] = not ptype[name_step]
+                    elif inputs[name_step].handle(ev):
                         name_step += 1
                         if name_step >= 2:
-                            left_name  = inputs[0].value()
-                            right_name = inputs[1].value()
-                            bs = make_board()
+                            # lock in who is computer-controlled for the match
+                            CPU_PLAYERS["left"]  = ptype[0]
+                            CPU_PLAYERS["right"] = ptype[1]
+
+                            def _pname(i):
+                                txt = inputs[i].text.strip()
+                                if ptype[i]:
+                                    return (txt + " (CPU)") if txt else "Computer"
+                                return txt or "Player"
+                            left_name  = _pname(0)
+                            right_name = _pname(1)
+                            # first defender gets the two-tile head start
+                            bs = make_board(first_attacker_is_left=atk_is_left)
                             phase = "pick"; color_step = 0; picker.reset()
                             gs = {"phase": "pick"}
 
             elif phase == "pick":
-                if ev.type == pygame.KEYDOWN:
-                    if ev.key == pygame.K_RETURN and picker.ready():
-                        if color_step == 0:
-                            atk_colors = picker.get()
-                            color_step = 1; picker.reset()
-                            confirm_msg = (f"Attack: "
-                                f"{ELEM_NAMES[atk_colors[0]]} + "
-                                f"{ELEM_NAMES[atk_colors[1]]}")
-                            confirm_timer = 1.8
+                picking_left = atk_is_left if color_step == 0 \
+                    else (not atk_is_left)
+                cpu_turn = CPU_PLAYERS["left" if picking_left else "right"]
+                if not cpu_turn:
+                    if ev.type == pygame.KEYDOWN:
+                        if ev.key == pygame.K_RETURN and picker.ready():
+                            # tutorial lessons require the taught pick
+                            if tut and not tut.get("free") and \
+                                    tuple(sorted(picker.get())) != tuple(sorted(
+                                        TUTORIAL_STEPS[tut["step"]]["player_pick"])):
+                                a, b = TUTORIAL_STEPS[tut["step"]]["player_pick"]
+                                confirm_msg = (f"Lesson: pick {ELEM_NAMES[a]}"
+                                               f" + {ELEM_NAMES[b]}")
+                                confirm_timer = 2.2
+                            else:
+                                do_submit()
                         else:
-                            def_colors = picker.get()
-                            plan = build_combat_plan(bs, atk_is_left,
-                                                     atk_colors, def_colors)
-                            anim  = AnimState(plan, bs)
-                            phase = "anim"
-                            gs = {"phase": "anim",
-                                  "atk_colors": atk_colors,
-                                  "def_colors": def_colors}
-                    else:
-                        picker.handle_key(ev.key)
-                if ev.type == pygame.MOUSEBUTTONDOWN:
-                    picker.handle_click(ev.pos)
+                            picker.handle_key(ev.key)
+                    if ev.type == pygame.MOUSEBUTTONDOWN:
+                        picker.handle_click(ev.pos)
 
             elif phase == "gameover":
                 if ev.type == pygame.KEYDOWN and ev.key == pygame.K_RETURN:
                     phase = "title"
+                    tut = None
 
         if phase == "name_entry":
             inputs[name_step].update(dt)
+
+        # computer player turn
+        if phase == "pick":
+            picking_left = atk_is_left if color_step == 0 else (not atk_is_left)
+            if CPU_PLAYERS["left" if picking_left else "right"]:
+                if ai_choice is None:
+                    if tut and not tut.get("free"):
+                        # the Tutor's picks are scripted by the lesson
+                        ai_choice = TUTORIAL_STEPS[tut["step"]]["cpu_pick"]
+                    elif color_step == 0:
+                        ai_choice = ai_choose_attack(bs, atk_is_left)
+                    else:
+                        ai_choice = ai_choose_defense(bs, atk_is_left)
+                    picker.reset()
+                    ai_timer = 0.0
+                ai_timer += dt
+                if color_step == 0:
+                    # attack picks must stay secret from the defender: no
+                    # staged reveal, no grid glow — think, then submit
+                    if ai_timer >= AI_SUBMIT_S * 0.7:
+                        picker.sel = list(ai_choice)
+                        do_submit()
+                else:
+                    # defense picks are revealed one by one with the glow
+                    want = min(2, int(ai_timer / AI_STEP_S))
+                    while len(picker.sel) < want:
+                        picker.sel.append(ai_choice[len(picker.sel)])
+                    if ai_timer >= AI_SUBMIT_S and picker.ready():
+                        do_submit()
 
         if phase == "anim" and anim is not None:
             if advance_anim(anim, dt):
@@ -1647,6 +2251,16 @@ def main():
                 anim        = None
                 if bs.hp_left <= 0 or bs.hp_right <= 0:
                     phase = "gameover"; gs = {"phase": "gameover"}
+                elif tut and not tut.get("free"):
+                    tut["step"] += 1
+                    if tut["step"] >= len(TUTORIAL_STEPS):
+                        # lessons done: play out the match for real
+                        tut = {"free": True}
+                        phase = "pick"; color_step = 0; picker.reset()
+                        atk_colors = None; def_colors = None
+                        gs = {"phase": "pick"}
+                    else:
+                        load_tut_step(bs.hp_left, bs.hp_right)
                 else:
                     phase = "pick"; color_step = 0; picker.reset()
                     atk_colors = None; def_colors = None
@@ -1666,6 +2280,32 @@ def main():
                 inp.draw(screen, font, bfont,
                          SCREEN_W//2 - 170, 150 + i*90,
                          active=(i == name_step))
+                rect = type_btns[i]
+                is_cpu = ptype[i]
+                pygame.draw.rect(screen, (34, 46, 62) if is_cpu else (36, 30, 22),
+                                 rect, border_radius=6)
+                bc = (120, 190, 255) if is_cpu else (110, 100, 85)
+                pygame.draw.rect(screen, bc, rect,
+                                 2 if i == name_step else 1, border_radius=6)
+                lbl = font.render("Computer" if is_cpu else "Human", True,
+                                  (150, 205, 255) if is_cpu else (200, 195, 185))
+                screen.blit(lbl, (rect.x + (rect.w - lbl.get_width()) // 2,
+                                  rect.y + (rect.h - lbl.get_height()) // 2))
+            hint = font.render(
+                "Click the button (or press Tab) to switch Human / Computer "
+                "— locked in for the match", True, (130, 125, 115))
+            screen.blit(hint, (SCREEN_W//2 - hint.get_width()//2, 360))
+
+            pygame.draw.rect(screen, (34, 46, 40), tut_btn, border_radius=6)
+            pygame.draw.rect(screen, (110, 200, 140), tut_btn, 1,
+                             border_radius=6)
+            tl = bfont.render("Tutorial", True, (150, 230, 170))
+            screen.blit(tl, (tut_btn.x + (tut_btn.w - tl.get_width()) // 2,
+                             tut_btn.y + (tut_btn.h - tl.get_height()) // 2))
+            tsub = font.render("New to the game? Learn it one turn at a time.",
+                               True, (110, 125, 112))
+            screen.blit(tsub, (SCREEN_W//2 - tsub.get_width()//2,
+                               tut_btn.bottom + 8))
 
         elif phase == "pick":
             picking_left = atk_is_left if color_step == 0 else (not atk_is_left)
@@ -1684,11 +2324,19 @@ def main():
             pick_info = {
                 "who": who, "role": role, "role_color": rc,
                 "picking_left": picking_left,
+                "cpu": CPU_PLAYERS["left" if picking_left else "right"],
                 "confirm_msg": confirm_msg, "confirm_timer": confirm_timer,
             }
             draw_sidebar(screen, fonts, sx, gs, pick_info)
             picker.draw(screen, font,
                         side="left" if picking_left else "right", anim_t=t)
+            if tut:
+                if tut.get("free"):
+                    draw_tut_panel(screen, fonts, TUTORIAL_FREE_LINES)
+                else:
+                    step = TUTORIAL_STEPS[tut["step"]]
+                    draw_tut_highlights(screen, step["highlight"], t)
+                    draw_tut_panel(screen, fonts, step["lines"])
 
         elif phase == "anim" and anim is not None:
             draw_animated(screen, anim, anim_t=t)
@@ -1698,8 +2346,12 @@ def main():
                 glow.draw(screen, anim.orig)
             draw_hud(screen, fonts, atk_is_left, turn)
             draw_player_bars(screen, fonts, left_name, right_name,
-                             bs.hp_left, bs.hp_right)
+                             anim.hp_left, anim.hp_right)
             draw_sidebar(screen, fonts, sx, gs)
+            if tut:
+                lines = TUTORIAL_FREE_LINES if tut.get("free") \
+                    else TUTORIAL_STEPS[tut["step"]]["lines"]
+                draw_tut_panel(screen, fonts, lines)
 
         elif phase == "gameover":
             draw_static(screen, bs)
