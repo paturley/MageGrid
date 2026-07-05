@@ -85,6 +85,7 @@ C_FRONTIER   = (255, 255, 255)
 #   22-24 weakened field (same facing rule)
 #   25-28 ball f0-f3 (mirrored for right attackers so rolling reads right)
 #   29-30 left scared s0-s1     31-32 right scared s0-s1
+#   33-34 left celebrate c0-c1  35-36 right celebrate c0-c1
 # ---------------------------------------------------------------------------
 
 SHEET_TILE = 24
@@ -134,15 +135,97 @@ def load_sprites():
                       "right": [tile(c, ci, True) for c in range(25, 29)]},
             "scared": {"left":  [tile(c, ci) for c in range(29, 31)],
                        "right": [tile(c, ci) for c in range(31, 33)]},
+            "celebrate": {"left":  [tile(c, ci) for c in range(33, 35)],
+                          "right": [tile(c, ci) for c in range(35, 37)]},
         }
+
+    _build_bg_tiles()
+
+
+# ---------------------------------------------------------------------------
+# Ground texture — each territory color gets a handful of pre-rendered tile
+# variants speckled with pebbles in in-between browns; a fixed random map
+# assigns a variant to every board cell so the field looks naturally varied
+# without repeating and without flickering between frames.
+# ---------------------------------------------------------------------------
+
+BG_VARIANTS = 8
+BG_TILES = {}          # side -> [Surface] * BG_VARIANTS
+BG_MAP = []            # BG_MAP[r][c] -> variant index
+
+# small shaded stones (body, shadow) per side
+BG_STONE = {
+    "left":  ((82, 52, 26), (38, 22, 8)),
+    "right": ((150, 113, 64), (128, 94, 52)),
+}
+
+
+def _shade(base, delta):
+    return tuple(max(0, min(255, ch + d)) for ch, d in zip(base, delta))
+
+
+def _build_bg_tiles():
+    """Organic ground: smoothed value-noise quantized to chunky 2x2 blocks
+    (the sprites' pixel scale), banded into faintly lighter/darker earth,
+    plus the occasional blocky pebble cluster."""
+    rng = random.Random(1207)
+    B = 2                       # texture pixel size
+    G = CELL // B               # blocks per tile side
+    C = 4                       # coarse noise grid (bigger = finer blobs)
+    for side, base in (("left", BG_LEFT), ("right", BG_RIGHT)):
+        lighter = _shade(base, (7, 5, 3))
+        darker = _shade(base, (-7, -5, -3))
+        tiles = []
+        for _ in range(BG_VARIANTS):
+            s = pygame.Surface((CELL, CELL))
+            s.fill(base)
+            grid = [[rng.random() for _ in range(C + 1)]
+                    for _ in range(C + 1)]
+            for by in range(G):
+                for bx in range(G):
+                    u, v = bx / G * C, by / G * C
+                    i, j = int(u), int(v)
+                    fu, fv = u - i, v - j
+                    fu = fu * fu * (3 - 2 * fu)     # smoothstep
+                    fv = fv * fv * (3 - 2 * fv)
+                    val = (grid[j][i] * (1 - fu) * (1 - fv) +
+                           grid[j][i + 1] * fu * (1 - fv) +
+                           grid[j + 1][i] * (1 - fu) * fv +
+                           grid[j + 1][i + 1] * fu * fv)
+                    if val > 0.64:
+                        col = lighter
+                    elif val < 0.36:
+                        col = darker
+                    else:
+                        continue
+                    pygame.draw.rect(s, col, (bx * B, by * B, B, B))
+            # about a third of tiles get a small cluster of blocky stones
+            if rng.random() < 0.35:
+                body, shadow = BG_STONE[side]
+                cx = rng.randrange(4, G - 5) * B
+                cy = rng.randrange(4, G - 5) * B
+                for _ in range(rng.randint(2, 3)):
+                    px = cx + rng.randrange(-3, 4) * B
+                    py = cy + rng.randrange(-3, 4) * B
+                    w = rng.choice((4, 6))
+                    pygame.draw.rect(s, shadow, (px, py + 2, w, 4))
+                    pygame.draw.rect(s, body, (px, py, w, 4))
+            tiles.append(s.convert())
+        BG_TILES[side] = tiles
+    BG_MAP.clear()
+    BG_MAP.extend([[rng.randrange(BG_VARIANTS) for _ in range(GRID_COLS)]
+                   for _ in range(GRID_ROWS)])
 
 
 def blit_sprite(dest, surf, x, y, alpha=255):
     if alpha >= 255:
         dest.blit(surf, (x, y))
     elif alpha > 0:
+        # scale the per-pixel alpha directly: set_alpha() on SRCALPHA
+        # surfaces is renderer-dependent (can draw opaque black boxes on
+        # some platforms); BLEND_RGBA_MULT is pure surface math everywhere
         tmp = surf.copy()
-        tmp.set_alpha(alpha)
+        tmp.fill((255, 255, 255, alpha), special_flags=pygame.BLEND_RGBA_MULT)
         dest.blit(tmp, (x, y))
 
 
@@ -779,24 +862,34 @@ def plan_score(plan, orig_bs, attacker_is_left, w=None):
             - w["loss"] * atk_lost + w["fmt"] * len(plan.hit_def_ids))
 
 
-def _pick_tempered(scored, rng, temper):
-    """scored: [(score, combo)]. Medium difficulty: usually the best move,
-    regularly the 2nd or 3rd, occasionally something else."""
+# Difficulty: every tier uses the same trained evaluation; they differ in
+# how faithfully they follow it. Probabilities over the RANKED moves only
+# (best, 2nd, ...) — no tier ever plays a random move, and none ever plays
+# worse than its listed depth (4th-best at Easy, 3rd at Medium, 2nd at Hard).
+AI_LEVELS = {
+    "easy":   (0.35, 0.30, 0.20, 0.15),
+    "medium": (0.55, 0.28, 0.17),
+    "hard":   (0.85, 0.15),
+}
+
+
+def _pick_ranked(scored, rng, level):
+    """scored: [(score, combo)]. level None = pure argmax (training)."""
     scored.sort(key=lambda s: -s[0])
-    if not temper or len(scored) < 3:
+    if level is None:
         return scored[0][1]
     r = rng.random()
-    if r < 0.55:
-        return scored[0][1]
-    if r < 0.80:
-        return scored[1][1]
-    if r < 0.95:
-        return scored[2][1]
-    return scored[rng.randrange(len(scored))][1]
+    acc = 0.0
+    dist = AI_LEVELS[level]
+    for i, p in enumerate(dist):
+        acc += p
+        if r < acc or i == len(dist) - 1 or i == len(scored) - 1:
+            return scored[min(i, len(scored) - 1)][1]
+    return scored[0][1]
 
 
 def ai_choose_attack(bs, attacker_is_left, weights=None, rng=random,
-                     temper=True, sample_defs=None):
+                     level="medium", sample_defs=None):
     """Pick attack elements: each pair is judged by its average outcome over
     the defenses the opponent might choose (unknown at attack time)."""
     defs = ALL_COMBOS if sample_defs is None \
@@ -808,11 +901,11 @@ def ai_choose_attack(bs, attacker_is_left, weights=None, rng=random,
             plan = build_combat_plan(bs.copy(), attacker_is_left, atk, dfn)
             tot += plan_score(plan, bs, attacker_is_left, weights)
         scored.append((tot / len(defs), atk))
-    return _pick_tempered(scored, rng, temper)
+    return _pick_ranked(scored, rng, level)
 
 
 def ai_choose_defense(bs, attacker_is_left, weights=None, rng=random,
-                      temper=True, sample_atks=None):
+                      level="medium", sample_atks=None):
     """Pick defense elements BLIND — the defender never sees the attack, so
     each pair is judged by its average outcome over the attacks the
     opponent might have chosen."""
@@ -825,7 +918,7 @@ def ai_choose_defense(bs, attacker_is_left, weights=None, rng=random,
             plan = build_combat_plan(bs.copy(), attacker_is_left, atk, dfn)
             tot -= plan_score(plan, bs, attacker_is_left, weights)
         scored.append((tot / len(atks), dfn))
-    return _pick_tempered(scored, rng, temper)
+    return _pick_ranked(scored, rng, level)
 
 
 # ---------------------------------------------------------------------------
@@ -872,6 +965,9 @@ class AnimState:
         # and the wind-down phases are skipped in favor of the victory sweep
         self.match_over_at: Optional[float] = None
         self.victory: Optional[dict] = None
+        # once a breakthrough lands, the attackers celebrate through the
+        # flash and keep it up while their army fades back in
+        self.breakthrough_happened: bool = False
 
         self.non_fmt_alpha: float = 255.0
         self.def_outline_alpha: float = 0.0
@@ -913,6 +1009,7 @@ class AnimState:
         if old_px < fai.frontier_cross_px <= new_px:
             for c in fai.initial_cols[:2]:
                 self.kill_cell(r, c, _slid_cx(c, fai.frontier_cross_px))
+            play_sfx("sacrifice")
 
         kill_i = 0
         for px, (kind, def_col) in zip(fai.event_px, fai.events):
@@ -923,11 +1020,14 @@ class AnimState:
                 continue
             if old_px < px <= new_px:
                 soldier_idx = 2 + kill_i
+                atk_c = fai.initial_cols[min(soldier_idx,
+                                             len(fai.initial_cols) - 1)]
                 if soldier_idx < len(fai.initial_cols):
-                    atk_c = fai.initial_cols[soldier_idx]
                     self.kill_cell(r, atk_c, _slid_cx(atk_c, px))
                 self.kill_cell(r, def_col)
                 self._advance_frontier(r, 1)
+                # the killer's element voices the kill
+                play_sfx(KILL_SFX[self.orig.board[r][atk_c]])
                 # the flanking cascade fires the moment this kill lands;
                 # flanked defenders die but their tiles stay defender-owned
                 for (vr, vc) in fai.flank_cells[kill_i]:
@@ -942,12 +1042,15 @@ class AnimState:
                     self.kill_cell(r, c, _slid_cx(c, fai.end_px))
                 # first hit: the wall turns weakened, its mages spent
                 self.red_def_ids.add(fai.blocked_by)
+                play_sfx("block")
 
         if fai.breakthrough:
             if old_px < fai.end_px <= new_px:
                 for c in fai.initial_cols:
                     self.kill_cell(r, c, _slid_cx(c, fai.end_px))
                 self.flash_alpha = 220.0
+                self.breakthrough_happened = True
+                play_sfx("breakthrough")
                 # the defender loses the hit point right now
                 if self.plan.attacker_is_left:
                     self.hp_right -= 1
@@ -979,7 +1082,12 @@ def advance_anim(state: AnimState, dt: float) -> bool:
             return False
 
     if state.phase == Phase.VICTORY:
+        prev_t = state.t
         state.t += dt
+        # each of the loser's units pops as its explosion fires
+        if state.victory and any(prev_t < te <= state.t
+                                 for te in state.victory["explode"].values()):
+            play_sfx("poof")
         if state.t >= VICTORY_DUR:
             state.phase = Phase.DONE
         return state.phase == Phase.DONE
@@ -1052,6 +1160,8 @@ def _update_fmt_slide(state: AnimState, dt: float):
 
     # the formation transforms into element balls before it marches
     if state.fmt_tf_t < TRANSFORM_DUR:
+        if state.fmt_tf_t == 0.0:
+            play_sfx("transform")
         state.fmt_tf_t += dt
         return
 
@@ -1107,11 +1217,12 @@ def _start_spawn(state: AnimState):
 #            rolling from their front line to their back edge
 #   1.1-2.0  the winner's troops march forward to occupy the whole board
 #   2.0-2.6  reinforcements fade in behind them
+#   2.6-4.4  the whole army celebrates
 VICT_MARCH0 = 1.1
 VICT_MARCH1 = 2.0
 VICT_SPAWN0 = 2.0
 VICT_SPAWN1 = 2.6
-VICTORY_DUR = 2.8
+VICTORY_DUR = 4.4
 
 
 def _start_victory(state: AnimState):
@@ -1190,11 +1301,19 @@ def _draw_victory(surf, state: AnimState, anim_t=0.0):
             draw_death_burst(surf, ci, c * CELL + CELL // 2,
                              r * CELL + GRID_Y + CELL // 2, t - te)
 
+    # once the board is theirs, the whole army celebrates
+    party = t >= VICT_SPAWN1
+    cel_f = int(state.total_t / 0.14) % 2
+
     # the winners march in...
     alpha = int(min(255, 255 * t / 0.4))
     for (r, c0, c1, ci) in v["moves"]:
         px = int((c0 + (c1 - c0) * p) * CELL)
-        draw_mage(surf, ci, atk_side, px, r * CELL + GRID_Y, alpha, anim_t)
+        if party:
+            draw_mage(surf, ci, atk_side, px, r * CELL + GRID_Y, alpha,
+                      pose="celebrate", pose_frame=cel_f)
+        else:
+            draw_mage(surf, ci, atk_side, px, r * CELL + GRID_Y, alpha, anim_t)
 
     # ...and their reinforcements appear behind them
     if t >= VICT_SPAWN0:
@@ -1202,7 +1321,11 @@ def _draw_victory(surf, state: AnimState, anim_t=0.0):
                      / (VICT_SPAWN1 - VICT_SPAWN0)))
         for (r, c, ci) in v["spawns"]:
             x, y = cell_xy(r, c)
-            draw_mage(surf, ci, atk_side, x, y, sa, anim_t)
+            if party:
+                draw_mage(surf, ci, atk_side, x, y, sa,
+                          pose="celebrate", pose_frame=cel_f)
+            else:
+                draw_mage(surf, ci, atk_side, x, y, sa, anim_t)
 
     draw_frontier_dots(surf, frontier)
     draw_grid(surf)
@@ -1241,8 +1364,13 @@ def draw_death_burst(surf, color_idx, cx, cy, age):
 def draw_bg(surf, frontier):
     for r in range(GRID_ROWS):
         for c in range(GRID_COLS):
-            color = BG_LEFT if c <= frontier[r] else BG_RIGHT
-            pygame.draw.rect(surf, color, cell_rect(r, c))
+            side = "left" if c <= frontier[r] else "right"
+            if BG_TILES:
+                surf.blit(BG_TILES[side][BG_MAP[r][c]],
+                          (c * CELL, r * CELL + GRID_Y))
+            else:
+                color = BG_LEFT if side == "left" else BG_RIGHT
+                pygame.draw.rect(surf, color, cell_rect(r, c))
 
 
 def draw_frontier_dots(surf, frontier):
@@ -1268,7 +1396,8 @@ def draw_grid(surf):
         pygame.draw.line(surf, C_GRID, (x, GRID_Y), (x, GRID_ROWS * CELL + GRID_Y), 1)
 
 
-def draw_static(surf, bs: BoardState, active_left=None, anim_t=0.0, glow=None):
+def draw_static(surf, bs: BoardState, active_left=None, anim_t=0.0, glow=None,
+                celebrate_t=None):
     draw_bg(surf, bs.frontier)
     if glow is not None:
         glow.draw(surf, bs)          # ground rings under the units
@@ -1277,9 +1406,14 @@ def draw_static(surf, bs: BoardState, active_left=None, anim_t=0.0, glow=None):
             ci = bs.board[r][c]
             is_left = bs.owner_is_left(r, c)
             side = "left" if is_left else "right"
-            t = anim_t if (active_left is None or is_left == active_left) else 0.0
             x, y = cell_xy(r, c)
-            draw_mage(surf, ci, side, x, y, anim_t=t)
+            if celebrate_t is not None:
+                draw_mage(surf, ci, side, x, y, pose="celebrate",
+                          pose_frame=int(celebrate_t / 0.14) % 2)
+            else:
+                t = anim_t if (active_left is None or
+                               is_left == active_left) else 0.0
+                draw_mage(surf, ci, side, x, y, anim_t=t)
     draw_frontier_dots(surf, bs.frontier)
     draw_grid(surf)
 
@@ -1337,6 +1471,12 @@ def draw_animated(surf, state: AnimState, anim_t=0.0):
     field_f = int(state.total_t / FIELD_FRAME_S) % 3
     scared_f = int(state.total_t / 0.12) % 2
     scared_cells = compute_scared_cells(state)
+    # a breakthrough: the defenders panic under the flash, and the attackers
+    # celebrate — through the flash and then as their army fades back in
+    celebrating = state.flash_alpha > 0 or \
+        (state.breakthrough_happened and
+         phase in (Phase.CLEANUP, Phase.RECLAIM))
+    cel_f = int(state.total_t / 0.14) % 2
 
     draw_bg(surf, state.vis_frontier)
 
@@ -1396,7 +1536,11 @@ def draw_animated(surf, state: AnimState, anim_t=0.0):
                             draw_mage(surf, ci, side, x, y, 255, anim_t)
                     else:
                         x, y = cell_xy(r, c)
-                        draw_mage(surf, ci, side, x, y, alpha, anim_t)
+                        if celebrating:
+                            draw_mage(surf, ci, side, x, y, alpha,
+                                      pose="celebrate", pose_frame=cel_f)
+                        else:
+                            draw_mage(surf, ci, side, x, y, alpha, anim_t)
                 continue
 
             # Attack formation cells
@@ -1421,7 +1565,11 @@ def draw_animated(surf, state: AnimState, anim_t=0.0):
                                       r * CELL + GRID_Y, ball_f)
                 else:
                     x, y = cell_xy(r, c)
-                    draw_mage(surf, ci, atk_side, x, y, 255, anim_t)
+                    if celebrating:
+                        draw_mage(surf, ci, atk_side, x, y,
+                                  pose="celebrate", pose_frame=cel_f)
+                    else:
+                        draw_mage(surf, ci, atk_side, x, y, 255, anim_t)
                 continue
 
             # Defense formation cells
@@ -1611,8 +1759,11 @@ class SelectionGlow:
 # ---------------------------------------------------------------------------
 
 # who is controlled by the computer — chosen on the name-entry screen and
-# locked in for the whole match
-CPU_PLAYERS = {"left": False, "right": False}
+# locked in for the whole match. Values: None (human) or an AI_LEVELS key.
+CPU_PLAYERS = {"left": None, "right": None}
+PLAYER_TYPES = [None, "easy", "medium", "hard"]
+TYPE_LABELS = {None: "Human", "easy": "Computer (Easy)",
+               "medium": "Computer (Medium)", "hard": "Computer (Hard)"}
 AI_STEP_S   = 0.55    # seconds between the AI revealing each element pick
 AI_SUBMIT_S = 1.8     # seconds until the AI confirms its picks
 
@@ -1712,11 +1863,13 @@ def draw_sidebar(surf, fonts, sx, gs, pick_info=None):
             surf.blit(_mini_sprite(ci, "fld", "left", 18), (sx + 70 + i * 24, y))
         y += 24
 
-    fy = SCREEN_H - 72
+    fy = SCREEN_H - 108
     pygame.draw.line(surf, (55, 50, 44),
                      (sx + 8, fy), (sx + SIDEBAR_W - 8, fy), 1)
     fy += 8
-    for line in ["W F L N R = elements", "Enter to confirm", "Click to select"]:
+    for line in ["W F L N R = elements", "Enter to confirm",
+                 "Click to select", "M = sound on/off",
+                 "ESC = pause / quit"]:
         surf.blit(font.render(line, True, (105, 103, 96)), (sx + 8, fy))
         fy += 18
 
@@ -1754,11 +1907,18 @@ class ElementPicker:
                 a = max(0.0, a - dt * SelectionGlow.FADE_OUT)
             self.glow_a[ci] = a
 
+    def _toggle(self, ci):
+        if ci in self.sel:
+            self.sel.remove(ci)
+            play_sfx("deselect")
+        elif len(self.sel) < 2:
+            self.sel.append(ci)
+            play_sfx("select")
+
     def handle_click(self, pos):
         for rect, ci in self.btns:
             if rect.collidepoint(pos):
-                if ci in self.sel: self.sel.remove(ci)
-                elif len(self.sel) < 2: self.sel.append(ci)
+                self._toggle(ci)
                 return True
         return False
 
@@ -1767,8 +1927,7 @@ class ElementPicker:
               pygame.K_n: 3, pygame.K_r: 4}
         ci = km.get(key)
         if ci is not None:
-            if ci in self.sel: self.sel.remove(ci)
-            elif len(self.sel) < 2: self.sel.append(ci)
+            self._toggle(ci)
 
     def draw(self, surf, font, side="left", anim_t=0.0):
         phase = (self.t / SelectionGlow.PERIOD) % 1.0
@@ -1793,6 +1952,72 @@ class ElementPicker:
         else:
             txt = "Pick 2 elements"
         surf.blit(font.render(txt, True, (195,195,175)), (self.sx+8, y))
+
+
+# ---------------------------------------------------------------------------
+# Music (generated offline by gen_music.py -> assets/*.wav)
+#   prelude — title + name screens (mustering for battle)
+#   battle  — the match itself
+#   victory — from the killing blow through the game-over screen
+# ---------------------------------------------------------------------------
+
+MUSIC_VOLUME = 0.6
+
+# --- sound effects (generated offline by gen_sfx.py -> assets/sfx_*.wav) ---
+SFX = {}
+SFX_ENABLED = True
+KILL_SFX = ("kill_water", "kill_fire", "kill_lightning",
+            "kill_nature", "kill_rock")          # indexed by element/color
+SFX_VOLS = {
+    "kill_water": 0.5, "kill_fire": 0.5, "kill_lightning": 0.5,
+    "kill_nature": 0.5, "kill_rock": 0.5,
+    "sacrifice": 0.3, "block": 0.55, "breakthrough": 0.68,
+    "transform": 0.38, "field": 0.38, "poof": 0.3,
+    "select": 0.3, "deselect": 0.26, "confirm": 0.38,
+}
+
+
+def load_sfx():
+    base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+    for name, vol in SFX_VOLS.items():
+        try:
+            snd = pygame.mixer.Sound(os.path.join(base, f"sfx_{name}.wav"))
+            snd.set_volume(vol)
+            SFX[name] = snd
+        except (pygame.error, FileNotFoundError):
+            pass                # missing file / no audio: that effect is silent
+
+
+def play_sfx(name):
+    if not SFX_ENABLED:
+        return
+    snd = SFX.get(name)
+    if snd is not None:
+        try:
+            snd.play()
+        except pygame.error:
+            pass
+
+
+def start_music_track(name, music_on=True):
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "assets", f"{name}.wav")
+    try:
+        pygame.mixer.music.load(path)
+        pygame.mixer.music.set_volume(MUSIC_VOLUME if music_on else 0.0)
+        pygame.mixer.music.play(-1)
+    except pygame.error:
+        pass                    # no audio device / missing file: stay silent
+
+
+def set_music_on(music_on):
+    """The M toggle governs all sound: music volume and effects."""
+    global SFX_ENABLED
+    SFX_ENABLED = music_on
+    try:
+        pygame.mixer.music.set_volume(MUSIC_VOLUME if music_on else 0.0)
+    except pygame.error:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -2051,6 +2276,9 @@ def draw_title(surf, fonts, t):
     pulse = int(190 + 60 * math.sin(t * 2.6))
     go = bfont.render("Press ENTER to begin", True, (pulse, pulse, pulse))
     surf.blit(go, (SCREEN_W//2 - go.get_width()//2, SCREEN_H//2 + 60))
+    esc = pygame.font.SysFont("segoeui", 16).render(
+        "ESC = quit  ·  M = sound on/off", True, (120, 115, 105))
+    surf.blit(esc, (SCREEN_W//2 - esc.get_width()//2, SCREEN_H - 44))
 
 
 # ---------------------------------------------------------------------------
@@ -2059,7 +2287,22 @@ def draw_title(surf, fonts, t):
 
 def main():
     pygame.init()
-    screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
+    # The game renders to a fixed logical canvas (`screen`), which is then
+    # scaled each frame to the largest aspect-preserving fit of the
+    # resizable window — any scale factor, bars on at most one axis — and
+    # mouse coordinates are mapped back through the same transform.
+    # open at 1.5x by default (clamped so it always fits the display)
+    info = pygame.display.Info()
+    win_scale = 1.5
+    if info.current_w > 0 and info.current_h > 0:
+        win_scale = min(win_scale,
+                        info.current_w * 0.94 / SCREEN_W,
+                        info.current_h * 0.90 / SCREEN_H)
+        win_scale = max(win_scale, 0.5)
+    window = pygame.display.set_mode((int(SCREEN_W * win_scale),
+                                      int(SCREEN_H * win_scale)),
+                                     pygame.RESIZABLE)
+    screen = pygame.Surface((SCREEN_W, SCREEN_H)).convert()
     pygame.display.set_caption("Mage Grid — Sprite Edition")
     clock = pygame.time.Clock()
     load_sprites()
@@ -2081,11 +2324,15 @@ def main():
 
     name_step = 0
     inputs    = [TextInput("Left player name:"), TextInput("Right player name:")]
-    # per-player Human/Computer choice, made on the name screen and locked
-    # in for the whole match
+    # per-player type (Human / Computer difficulty), cycled on the name
+    # screen and locked in for the whole match
     ptype     = [CPU_PLAYERS["left"], CPU_PLAYERS["right"]]
-    type_btns = [pygame.Rect(SCREEN_W // 2 + 190, 150 + i * 90 + 14, 150, 30)
+    type_btns = [pygame.Rect(SCREEN_W // 2 + 190, 150 + i * 90 + 14, 170, 30)
                  for i in range(2)]
+
+    def cycle_type(i):
+        ptype[i] = PLAYER_TYPES[(PLAYER_TYPES.index(ptype[i]) + 1)
+                                % len(PLAYER_TYPES)]
 
     picker     = ElementPicker(sx)
     glow       = SelectionGlow()
@@ -2099,12 +2346,25 @@ def main():
     ai_timer      = 0.0
     tut           = None      # None | {"step": i} | {"free": True}
     tut_btn       = pygame.Rect(SCREEN_W // 2 - 75, 430, 150, 34)
+    music_on      = True
+    cur_track     = None
+    paused        = None      # None | "match" (quit to title) | "app" (quit game)
     load_ai_weights()
+    load_sfx()
+
+    def play_track(name):
+        nonlocal cur_track
+        if cur_track != name:
+            cur_track = name
+            start_music_track(name, music_on)
+
+    play_track("prelude")
 
     def do_submit():
         """Confirm the picker's two elements (Enter key or computer turn)."""
         nonlocal color_step, atk_colors, def_colors, confirm_msg
         nonlocal confirm_timer, anim, phase, gs, ai_choice, ai_timer
+        play_sfx("confirm")
         if color_step == 0:
             atk_colors = picker.get()
             color_step = 1
@@ -2120,6 +2380,8 @@ def main():
             gs = {"phase": "anim",
                   "atk_colors": atk_colors,
                   "def_colors": def_colors}
+            if plan.defense_formations:
+                play_sfx("field")          # the walls rise
         ai_choice = None
         ai_timer = 0.0
 
@@ -2137,12 +2399,62 @@ def main():
 
     while True:
         dt = clock.tick(FPS) / 1000.0
+        if paused:
+            dt = 0.0             # the whole game world freezes
         t += dt
         confirm_timer = max(0.0, confirm_timer - dt)
+
+        # window -> logical canvas transform for this frame
+        win_w, win_h = window.get_size()
+        view_scale = min(win_w / SCREEN_W, win_h / SCREEN_H)
+        view_w = max(1, int(SCREEN_W * view_scale))
+        view_h = max(1, int(SCREEN_H * view_scale))
+        view_x = (win_w - view_w) // 2
+        view_y = (win_h - view_h) // 2
 
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
                 pygame.quit(); sys.exit()
+
+            # map window mouse coordinates back into the logical canvas
+            if ev.type == pygame.MOUSEBUTTONDOWN and view_scale > 0:
+                mx, my = ev.pos
+                lp = (int((mx - view_x) / view_scale),
+                      int((my - view_y) / view_scale))
+                ev = pygame.event.Event(ev.type, {**ev.dict, "pos": lp})
+
+            # music toggle (everywhere except while typing a name)
+            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_m and \
+                    phase != "name_entry":
+                music_on = not music_on
+                set_music_on(music_on)
+
+            # paused: only the quit prompt listens
+            if paused:
+                if ev.type == pygame.KEYDOWN:
+                    if ev.key == pygame.K_y:
+                        if paused == "app":
+                            pygame.quit(); sys.exit()
+                        paused = None
+                        phase = "title"; gs = {"phase": "title"}
+                        anim = None; tut = None
+                        picker.reset(); color_step = 0
+                        atk_colors = None; def_colors = None
+                        ai_choice = None; ai_timer = 0.0
+                        play_track("prelude")
+                    elif ev.key in (pygame.K_n, pygame.K_ESCAPE):
+                        paused = None
+                continue
+
+            # ESC: during a match, offer quit-to-title; on the title and
+            # name screens, offer quitting the game entirely
+            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                if phase in ("pick", "anim"):
+                    paused = "match"
+                    continue
+                if phase in ("title", "name_entry"):
+                    paused = "app"
+                    continue
 
             if phase == "title":
                 if ev.type == pygame.KEYDOWN and ev.key == pygame.K_RETURN:
@@ -2154,17 +2466,18 @@ def main():
                 if ev.type == pygame.MOUSEBUTTONDOWN:
                     for i, rect in enumerate(type_btns):
                         if rect.collidepoint(ev.pos):
-                            ptype[i] = not ptype[i]
+                            cycle_type(i)
                     if tut_btn.collidepoint(ev.pos):
                         tut = {"step": 0}
-                        CPU_PLAYERS["left"] = False
-                        CPU_PLAYERS["right"] = True
+                        CPU_PLAYERS["left"] = None
+                        CPU_PLAYERS["right"] = "medium"
                         left_name, right_name = "You", "Tutor (CPU)"
                         turn = 1
                         load_tut_step(HP_MAX, 2)
+                        play_track("battle")
                 if ev.type == pygame.KEYDOWN:
                     if ev.key == pygame.K_TAB:
-                        ptype[name_step] = not ptype[name_step]
+                        cycle_type(name_step)
                     elif inputs[name_step].handle(ev):
                         name_step += 1
                         if name_step >= 2:
@@ -2175,7 +2488,9 @@ def main():
                             def _pname(i):
                                 txt = inputs[i].text.strip()
                                 if ptype[i]:
-                                    return (txt + " (CPU)") if txt else "Computer"
+                                    tag = ptype[i].title()
+                                    return (txt + f" ({tag} CPU)") if txt \
+                                        else f"CPU ({tag})"
                                 return txt or "Player"
                             left_name  = _pname(0)
                             right_name = _pname(1)
@@ -2183,6 +2498,7 @@ def main():
                             bs = make_board(first_attacker_is_left=atk_is_left)
                             phase = "pick"; color_step = 0; picker.reset()
                             gs = {"phase": "pick"}
+                            play_track("battle")
 
             elif phase == "pick":
                 picking_left = atk_is_left if color_step == 0 \
@@ -2210,6 +2526,7 @@ def main():
                 if ev.type == pygame.KEYDOWN and ev.key == pygame.K_RETURN:
                     phase = "title"
                     tut = None
+                    play_track("prelude")
 
         if phase == "name_entry":
             inputs[name_step].update(dt)
@@ -2219,13 +2536,16 @@ def main():
             picking_left = atk_is_left if color_step == 0 else (not atk_is_left)
             if CPU_PLAYERS["left" if picking_left else "right"]:
                 if ai_choice is None:
+                    level = CPU_PLAYERS["left" if picking_left else "right"]
                     if tut and not tut.get("free"):
                         # the Tutor's picks are scripted by the lesson
                         ai_choice = TUTORIAL_STEPS[tut["step"]]["cpu_pick"]
                     elif color_step == 0:
-                        ai_choice = ai_choose_attack(bs, atk_is_left)
+                        ai_choice = ai_choose_attack(bs, atk_is_left,
+                                                     level=level)
                     else:
-                        ai_choice = ai_choose_defense(bs, atk_is_left)
+                        ai_choice = ai_choose_defense(bs, atk_is_left,
+                                                      level=level)
                     picker.reset()
                     ai_timer = 0.0
                 ai_timer += dt
@@ -2244,6 +2564,9 @@ def main():
                         do_submit()
 
         if phase == "anim" and anim is not None:
+            # the killing blow cues the victory theme immediately
+            if anim.match_over_at is not None:
+                play_track("victory")
             if advance_anim(anim, dt):
                 bs          = anim.plan.final_board
                 turn       += 1
@@ -2281,19 +2604,19 @@ def main():
                          SCREEN_W//2 - 170, 150 + i*90,
                          active=(i == name_step))
                 rect = type_btns[i]
-                is_cpu = ptype[i]
+                is_cpu = ptype[i] is not None
                 pygame.draw.rect(screen, (34, 46, 62) if is_cpu else (36, 30, 22),
                                  rect, border_radius=6)
                 bc = (120, 190, 255) if is_cpu else (110, 100, 85)
                 pygame.draw.rect(screen, bc, rect,
                                  2 if i == name_step else 1, border_radius=6)
-                lbl = font.render("Computer" if is_cpu else "Human", True,
+                lbl = font.render(TYPE_LABELS[ptype[i]], True,
                                   (150, 205, 255) if is_cpu else (200, 195, 185))
                 screen.blit(lbl, (rect.x + (rect.w - lbl.get_width()) // 2,
                                   rect.y + (rect.h - lbl.get_height()) // 2))
             hint = font.render(
-                "Click the button (or press Tab) to switch Human / Computer "
-                "— locked in for the match", True, (130, 125, 115))
+                "Click the button (or press Tab) to cycle Human / Computer "
+                "difficulty — locked in for the match", True, (130, 125, 115))
             screen.blit(hint, (SCREEN_W//2 - hint.get_width()//2, 360))
 
             pygame.draw.rect(screen, (34, 46, 40), tut_btn, border_radius=6)
@@ -2306,6 +2629,9 @@ def main():
                                True, (110, 125, 112))
             screen.blit(tsub, (SCREEN_W//2 - tsub.get_width()//2,
                                tut_btn.bottom + 8))
+            esc_hint = font.render("ESC = quit", True, (120, 115, 105))
+            screen.blit(esc_hint, (SCREEN_W//2 - esc_hint.get_width()//2,
+                                   tut_btn.bottom + 34))
 
         elif phase == "pick":
             picking_left = atk_is_left if color_step == 0 else (not atk_is_left)
@@ -2354,7 +2680,8 @@ def main():
                 draw_tut_panel(screen, fonts, lines)
 
         elif phase == "gameover":
-            draw_static(screen, bs)
+            # the winning army keeps celebrating behind the overlay
+            draw_static(screen, bs, celebrate_t=t)
             draw_hud(screen, fonts, atk_is_left, turn)
             draw_player_bars(screen, fonts, left_name, right_name,
                              bs.hp_left, bs.hp_right)
@@ -2372,6 +2699,31 @@ def main():
             sub = font.render("Press ENTER to return to title", True, (175,175,175))
             screen.blit(sub, (cx - sub.get_width()//2, SCREEN_H//2 + 20))
 
+        # pause overlay: the frozen game stays visible underneath
+        if paused:
+            ov = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+            ov.fill((0, 0, 0, 140))
+            screen.blit(ov, (0, 0))
+            box = pygame.Rect(0, 0, 380, 150)
+            box.center = (SCREEN_W // 2, SCREEN_H // 2)
+            pygame.draw.rect(screen, (28, 22, 16), box, border_radius=10)
+            pygame.draw.rect(screen, (215, 192, 120), box, 2, border_radius=10)
+            hdr = bfont.render("PAUSED", True, (255, 216, 120))
+            screen.blit(hdr, (box.centerx - hdr.get_width() // 2, box.y + 18))
+            q_txt = "Quit the game?" if paused == "app" \
+                else "Quit to the title screen?"
+            q = font.render(q_txt, True, (210, 205, 195))
+            screen.blit(q, (box.centerx - q.get_width() // 2, box.y + 58))
+            yn = font.render("Y = quit        N = resume", True, (160, 155, 145))
+            screen.blit(yn, (box.centerx - yn.get_width() // 2, box.y + 96))
+
+        # present the logical canvas scaled to the window
+        if (win_w, win_h) == (SCREEN_W, SCREEN_H):
+            window.blit(screen, (0, 0))
+        else:
+            window.fill((0, 0, 0))
+            frame = pygame.transform.smoothscale(screen, (view_w, view_h))
+            window.blit(frame, (view_x, view_y))
         pygame.display.flip()
 
 
