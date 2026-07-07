@@ -1,5 +1,5 @@
 """
-Mage Grid — Sprite Edition.
+ManaFront — a tactical grid battle.
 
 Same rules and combat engine as mage_grid.py, with pixel-art mage sprites:
 
@@ -43,7 +43,7 @@ STARTING_FRONTIER = 4          # cols 0-4 left, 5-9 right
 CELL = 62
 SIDEBAR_W = 230
 HUD_H = 72
-PLAYER_BAR_H = 28               # strip above grid, split left/right
+PLAYER_BAR_H = 46               # strip above grid, split left/right (name over HP bar)
 GRID_Y = HUD_H + PLAYER_BAR_H  # pixel y where the grid starts
 SCREEN_W = GRID_COLS * CELL + SIDEBAR_W
 SCREEN_H = GRID_Y + GRID_ROWS * CELL
@@ -304,7 +304,10 @@ def make_board(first_attacker_is_left=True):
     frontier = [STARTING_FRONTIER] * GRID_ROWS
     for r in HANDICAP_ROWS:
         frontier[r] = STARTING_FRONTIER + (-1 if first_attacker_is_left else 1)
-    return BoardState(board=board, frontier=frontier)
+    # pass HP explicitly: HP_MAX is adjustable in the Settings menu, and the
+    # dataclass defaults were frozen at class-definition time
+    return BoardState(board=board, frontier=frontier,
+                      hp_left=HP_MAX, hp_right=HP_MAX)
 
 
 # ---------------------------------------------------------------------------
@@ -1337,6 +1340,72 @@ def _draw_victory(surf, state: AnimState, anim_t=0.0):
 
 
 # ---------------------------------------------------------------------------
+# Stalemate reshuffle — if four consecutive attack turns (two per player)
+# produce no attack formations, both armies are dissolved and fresh units
+# phase in. Territory borders and HP are untouched.
+# ---------------------------------------------------------------------------
+
+STALEMATE_TURNS = 4
+RESH_FADE0 = 1.25
+RESH_FADE1 = 2.05
+RESH_DUR = 2.4
+
+
+def start_reshuffle(bs):
+    explode = {}
+    for r in range(GRID_ROWS):
+        for c in range(GRID_COLS):
+            explode[(r, c)] = 0.1 + c * 0.07 + ((r * 7 + c * 13) % 4) * 0.05
+    new_bs = BoardState(
+        [[random.randrange(NUM_COLORS) for _ in range(GRID_COLS)]
+         for _ in range(GRID_ROWS)],
+        bs.frontier[:], bs.hp_left, bs.hp_right)
+    return {"t": 0.0, "old": [row[:] for row in bs.board],
+            "explode": explode, "new_bs": new_bs,
+            "frontier": bs.frontier[:]}
+
+
+def draw_reshuffle(surf, resh, fonts, anim_t=0.0):
+    font, bfont, _ = fonts
+    t = resh["t"]
+    frontier = resh["frontier"]
+    draw_bg(surf, frontier)
+
+    for (r, c), te in resh["explode"].items():
+        side = "left" if c <= frontier[r] else "right"
+        if t < te:
+            x, y = cell_xy(r, c)
+            draw_mage(surf, resh["old"][r][c], side, x, y, 255, anim_t)
+        elif t - te < DEATH_DUR:
+            draw_death_burst(surf, resh["old"][r][c],
+                             c * CELL + CELL // 2,
+                             r * CELL + GRID_Y + CELL // 2, t - te)
+
+    if t >= RESH_FADE0:
+        a = int(min(255, 255 * (t - RESH_FADE0) / (RESH_FADE1 - RESH_FADE0)))
+        nb = resh["new_bs"]
+        for r in range(GRID_ROWS):
+            for c in range(GRID_COLS):
+                side = "left" if c <= frontier[r] else "right"
+                x, y = cell_xy(r, c)
+                draw_mage(surf, nb.board[r][c], side, x, y, a, anim_t)
+
+    draw_frontier_dots(surf, frontier)
+    draw_grid(surf)
+
+    bar_y = GRID_Y + (GRID_ROWS * CELL - 64) // 2
+    bar = pygame.Surface((GRID_COLS * CELL, 64), pygame.SRCALPHA)
+    bar.fill((0, 0, 0, 150))
+    surf.blit(bar, (0, bar_y))
+    cx = GRID_COLS * CELL // 2
+    h1 = bfont.render("STALEMATE!", True, (255, 216, 120))
+    h2 = font.render("Both armies are recalled — fresh forces arrive",
+                     True, (215, 210, 200))
+    surf.blit(h1, (cx - h1.get_width() // 2, bar_y + 8))
+    surf.blit(h2, (cx - h2.get_width() // 2, bar_y + 36))
+
+
+# ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
 
@@ -1771,7 +1840,7 @@ AI_SUBMIT_S = 1.8     # seconds until the AI confirms its picks
 def draw_hud(surf, fonts, atk_is_left, turn):
     font, bfont, _ = fonts
     pygame.draw.rect(surf, BG_HUD, (0, 0, SCREEN_W, HUD_H))
-    title = bfont.render("MAGE GRID", True, (215, 192, 120))
+    title = bfont.render("MANAFRONT", True, (215, 192, 120))
     surf.blit(title, (8, 6))
     who = f"Turn {turn}  ·  {'LEFT' if atk_is_left else 'RIGHT'} attacks"
     surf.blit(font.render(who, True, (160, 160, 160)), (8, 30))
@@ -1784,21 +1853,27 @@ def draw_player_bars(surf, fonts, left_name, right_name, hp_left, hp_right):
     mid_x  = (GRID_COLS // 2) * CELL   # pixel x of the grid midpoint
     ty     = HUD_H
 
+    hp_y = ty + PLAYER_BAR_H - 19   # HP bar row, under the name row
+    max_w = mid_x - 16              # room for the name inside one half
+
+    def _name_surf(text, color):
+        s = bfont.render(text, True, color)
+        if s.get_width() > max_w:               # long name: smaller font
+            s = font.render(text, True, color)
+        while s.get_width() > max_w and len(text) > 1:   # still too long
+            text = text[:-1]
+            s = font.render(text + "…", True, color)
+        return s
+
     # Left player bar (dark background, above left territory)
     pygame.draw.rect(surf, (42, 26, 10), (0, ty, mid_x, PLAYER_BAR_H))
-    name_s = bfont.render(left_name, True, (210, 185, 140))
-    surf.blit(name_s, (8, ty + (PLAYER_BAR_H - name_s.get_height()) // 2))
-    _player_hp_bar(surf, font, hp_left,
-                   mid_x - 180, ty + (PLAYER_BAR_H - 14) // 2,
-                   140, (90, 145, 255))
+    surf.blit(_name_surf(left_name, (210, 185, 140)), (8, ty + 3))
+    _player_hp_bar(surf, font, hp_left, 8, hp_y, 140, (90, 145, 255))
 
     # Right player bar (light background, above right territory)
     pygame.draw.rect(surf, (115, 82, 40), (mid_x, ty, grid_w - mid_x, PLAYER_BAR_H))
-    name_s = bfont.render(right_name, True, (255, 240, 195))
-    surf.blit(name_s, (mid_x + 8, ty + (PLAYER_BAR_H - name_s.get_height()) // 2))
-    _player_hp_bar(surf, font, hp_right,
-                   grid_w - 180, ty + (PLAYER_BAR_H - 14) // 2,
-                   140, (255, 100, 45))
+    surf.blit(_name_surf(right_name, (255, 240, 195)), (mid_x + 8, ty + 3))
+    _player_hp_bar(surf, font, hp_right, mid_x + 8, hp_y, 140, (255, 100, 45))
 
 
 def _player_hp_bar(surf, font, hp, x, y, bw, color):
@@ -1966,6 +2041,7 @@ MUSIC_VOLUME = 0.6
 # --- sound effects (generated offline by gen_sfx.py -> assets/sfx_*.wav) ---
 SFX = {}
 SFX_ENABLED = True
+SFX_MASTER  = 1.0    # SFX volume from the Settings menu (0.0 - 1.0)
 KILL_SFX = ("kill_water", "kill_fire", "kill_lightning",
             "kill_nature", "kill_rock")          # indexed by element/color
 SFX_VOLS = {
@@ -1994,6 +2070,7 @@ def play_sfx(name):
     snd = SFX.get(name)
     if snd is not None:
         try:
+            snd.set_volume(SFX_VOLS.get(name, 0.5) * SFX_MASTER)
             snd.play()
         except pygame.error:
             pass
@@ -2245,10 +2322,108 @@ class TextInput:
 
 
 # ---------------------------------------------------------------------------
+# Name-screen ambient duel: a random attacker turns into an element ball and
+# flies at a random defender, who either raises a force field or panics;
+# both fade out and a fresh pair appears with the roles swapped.
+# ---------------------------------------------------------------------------
+
+DUEL_Y        = 340                # sprite top edge on the name screen
+DUEL_MARGIN   = 96                 # distance of each duelist from the edge
+DUEL_TF0      = 1.00               # attacker starts transforming
+DUEL_BALL0    = 1.60               # ball takes off
+DUEL_CAST0    = 1.90               # field outcome: defender starts casting
+DUEL_FLD0     = 2.35               # field rises / panic begins
+DUEL_HIT      = 2.90               # ball arrives
+DUEL_DEF_EXPL = 3.45               # field outcome: defender+field explode
+
+
+def new_name_duel(atk_left=True):
+    field = random.random() < 0.5                 # else: panic
+    last = DUEL_DEF_EXPL if field else DUEL_HIT   # final explosion
+    return {"atk_left": atk_left,
+            "ac": random.randrange(NUM_COLORS),   # attacker element
+            "dc": random.randrange(NUM_COLORS),   # defender element
+            "field": field,
+            "end": last + DEATH_DUR + 0.35,
+            "t": 0.0}
+
+
+def draw_name_duel(surf, duel):
+    t = duel["t"]
+    atk_left = duel["atk_left"]
+    y = DUEL_Y
+    cy = y + SPRITE_PX // 2                       # burst center height
+    lx, rx = DUEL_MARGIN, SCREEN_W - DUEL_MARGIN - SPRITE_PX
+    ax, dx = (lx, rx) if atk_left else (rx, lx)
+    aside = "left" if atk_left else "right"
+    dside = "right" if atk_left else "left"
+    d = 1 if atk_left else -1                     # ball travel direction
+    ac, dc = duel["ac"], duel["dc"]
+    fx = dx - d * 10                              # field hugs the front edge
+    stop = dx - d * (40 if duel["field"] else 18) # where the ball connects
+
+    # attacker: idle, then transform into the ball
+    if t < DUEL_TF0:
+        blit_sprite(surf, SPRITES[ac]["idle"][aside][idle_frame(t)], ax, y)
+    elif t < DUEL_BALL0:
+        f = min(2, int((t - DUEL_TF0) / 0.2))
+        blit_sprite(surf, SPRITES[ac]["tf"][aside][f], ax, y)
+
+    # the element ball flies across, then bursts on whatever it hits
+    if DUEL_BALL0 <= t < DUEL_HIT:
+        p = (t - DUEL_BALL0) / (DUEL_HIT - DUEL_BALL0)
+        bx = int(ax + (stop - ax) * p)
+        bf = int(t / 0.12) % 4
+        blit_sprite(surf, SPRITES[ac]["ball"][aside][bf], bx, y)
+    elif DUEL_HIT <= t < DUEL_HIT + DEATH_DUR:
+        draw_death_burst(surf, ac, stop + SPRITE_PX // 2, cy, t - DUEL_HIT)
+
+    # defender: force field or panic
+    if duel["field"]:
+        if t < DUEL_CAST0:
+            blit_sprite(surf, SPRITES[dc]["idle"][dside][idle_frame(t)],
+                        dx, y)
+        elif t < DUEL_FLD0:
+            f = min(2, int((t - DUEL_CAST0) / 0.15))
+            blit_sprite(surf, SPRITES[dc]["cast"][dside][f], dx, y)
+        elif t < DUEL_DEF_EXPL:
+            if t < DUEL_HIT:
+                unit = SPRITES[dc]["idle"][dside][idle_frame(t)]
+            else:                       # spent from holding the field
+                unit = SPRITES[dc]["tired"][dside][int(t / 0.24) % 2]
+            blit_sprite(surf, unit, dx, y)
+            bank = "fld" if t < DUEL_HIT else "dmg"   # the hit weakens it
+            ff = min(2, int((t - DUEL_FLD0) / 0.12))
+            blit_sprite(surf, SPRITES[dc][bank][dside][ff], fx, y)
+        elif t < DUEL_DEF_EXPL + DEATH_DUR:
+            age = t - DUEL_DEF_EXPL
+            draw_death_burst(surf, dc, dx + SPRITE_PX // 2, cy, age)
+            draw_death_burst(surf, dc, fx + SPRITE_PX // 2, cy - 8, age)
+    else:
+        if t < DUEL_FLD0:
+            blit_sprite(surf, SPRITES[dc]["idle"][dside][idle_frame(t)],
+                        dx, y)
+        elif t < DUEL_HIT:
+            sf = int(t / 0.14) % 2
+            blit_sprite(surf, SPRITES[dc]["scared"][dside][sf], dx, y)
+        elif t < DUEL_HIT + DEATH_DUR:
+            draw_death_burst(surf, dc, dx + SPRITE_PX // 2, cy, t - DUEL_HIT)
+
+
+# ---------------------------------------------------------------------------
 # Title screen
 # ---------------------------------------------------------------------------
 
-def draw_title(surf, fonts, t):
+TITLE_MENU = ("New Game", "Rules", "Settings", "Quit")
+
+
+def title_menu_rects():
+    y0 = SCREEN_H // 2 + 52
+    return [pygame.Rect(SCREEN_W // 2 - 110, y0 + i * 44, 220, 36)
+            for i in range(len(TITLE_MENU))]
+
+
+def draw_title(surf, fonts, t, menu_idx=0):
     _, bfont, tfont = fonts
     surf.fill((12, 8, 4))
     for i in range(40):
@@ -2260,7 +2435,7 @@ def draw_title(surf, fonts, t):
         pygame.draw.circle(s, (210,195,140,a), (1,1), 1)
         surf.blit(s, (x,y))
     random.seed()
-    title = tfont.render("MAGE GRID", True, (218, 192, 100))
+    title = tfont.render("MANAFRONT", True, (218, 192, 100))
     surf.blit(title, (SCREEN_W//2 - title.get_width()//2, SCREEN_H//3 - 50))
     sub = bfont.render("A tactical grid battle", True, (150,140,120))
     surf.blit(sub, (SCREEN_W//2 - sub.get_width()//2, SCREEN_H//3 + 38))
@@ -2273,12 +2448,1021 @@ def draw_title(surf, fonts, t):
         surf.blit(SPRITES[i]["idle"]["left"][seq_f],
                   (x0 + i * (SPRITE_PX + 18), SCREEN_H // 2 - 20))
 
-    pulse = int(190 + 60 * math.sin(t * 2.6))
-    go = bfont.render("Press ENTER to begin", True, (pulse, pulse, pulse))
-    surf.blit(go, (SCREEN_W//2 - go.get_width()//2, SCREEN_H//2 + 60))
-    esc = pygame.font.SysFont("segoeui", 16).render(
-        "ESC = quit  ·  M = sound on/off", True, (120, 115, 105))
-    surf.blit(esc, (SCREEN_W//2 - esc.get_width()//2, SCREEN_H - 44))
+    # main menu (arrows + Enter, or mouse)
+    for i, r in enumerate(title_menu_rects()):
+        sel = (i == menu_idx)
+        if sel:
+            pulse = int(46 + 14 * math.sin(t * 3.0))
+            pygame.draw.rect(surf, (pulse, pulse - 12, 14), r, border_radius=8)
+            pygame.draw.rect(surf, (235, 205, 110), r, 2, border_radius=8)
+            col = (255, 228, 130)
+            # small pointer triangles either side of the selected entry
+            for px, d in ((r.x - 16, 1), (r.right + 16, -1)):
+                pygame.draw.polygon(surf, col,
+                                    [(px, r.centery - 7), (px, r.centery + 7),
+                                     (px + d * 10, r.centery)])
+        else:
+            pygame.draw.rect(surf, (95, 82, 60), r, 1, border_radius=8)
+            col = (172, 162, 142)
+        s = bfont.render(TITLE_MENU[i], True, col)
+        surf.blit(s, (r.centerx - s.get_width() // 2,
+                      r.centery - s.get_height() // 2))
+
+
+# --- Rules popup (placeholder text for now) --------------------------------
+
+RULES_LINE_H = 22
+RULES_VIEW_H = 352
+RULES_TEXT = [
+    "#Objective",
+    "Reduce your opponent's HP to zero by breaking through their",
+    "back line with attack formations.",
+    "",
+    "#Attacking",
+    "The attacker secretly picks two elements (water, fire,",
+    "lightning, nature, or rock). Every horizontal run of 3 or",
+    "more units of those elements — pure or mixed — becomes an",
+    "attack formation. After the defender picks their defense,",
+    "the attack formations transform into elemental balls of",
+    "energy and advance on the defending line, one at a time,",
+    "from top to bottom and front to back.",
+    "",
+    "@attack_anim",     # animated demo strip (3 text lines tall)
+    "",
+    "",
+    "#Moving the Front",
+    "The first two units of each attack formation die crossing",
+    "the front. After that, each attacking unit trades itself for",
+    "the defender's front unit: both die and the rest of the",
+    "formation advances. The territory where those defenders",
+    "stood is ceded to the attacker.",
+    "",
+    "@front_anim",      # animated demo strip (3 text lines tall)
+    "",
+    "",
+    "#Flanking",
+    "A formation that kills at least two units in its row also",
+    "flanks the neighboring rows. Each kill after the first",
+    "extends the flank one row further above and below every",
+    "column captured earlier, carving out a wedge. Flanking does",
+    "not extend past the attacker's own units, empty squares, or",
+    "the board's edge. When a defender is defeated behind",
+    "surviving defenders, the survivors retreat to fill the gap",
+    "and the territory in front of them is ceded to the attacker.",
+    "",
+    "@flank_anim",      # animated demo strip (9 text lines tall)
+    "", "", "", "", "", "", "", "",
+    "#Defending",
+    "After the attacker locks in their elements, the defender",
+    "picks two elements of their own. Every vertical run of 3 or",
+    "more units of those elements — pure or mixed — becomes a",
+    "defense formation. A formation hit by an attack, either",
+    "head-on or by flanking, is exhausted: it keeps blocking",
+    "attacks until the end of the attack phase — each blocked",
+    "attack formation is destroyed — and then the whole defense",
+    "formation dies. Its territory is retained by the defender.",
+    "",
+    "@def_anim",        # animated demo strip (9 text lines tall)
+    "", "", "", "", "", "", "", "",
+    "#Breakthrough",
+    "Each attack formation that reaches the back line costs the",
+    "defender one HP, and the formation's remaining units die.",
+    "At the end of the attack phase the defender pushes back:",
+    "they reclaim at least the first 4 squares of any row where",
+    "the back line was hit, 3 in the rows above and below, 2 in",
+    "the next rows out, and 1 beyond those. Any attacking units",
+    "left standing in reclaimed squares die.",
+    "",
+    "@bt_anim",         # animated demo strip (15 text lines tall)
+    "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+    "#Troops Refresh",
+    "At the end of the attack phase, both armies advance toward",
+    "the front, filling the empty squares in their territory,",
+    "and new reinforcements appear at the back — except in rows",
+    "hit by flanking, where the retreating defenders hold the",
+    "rear and reinforcements fill in at the front. Then the",
+    "attacker and defender swap roles.",
+    "",
+    "@refresh_anim",    # animated demo strip (9 text lines tall)
+    "", "", "", "", "", "", "", "",
+    "#Stalemate Refresh",
+    "If both players go two attack phases each (four turns in a",
+    "row) without forming a single attack formation, the board",
+    "refreshes: every unit on both sides dies and new units",
+    "appear across the board. No territory is lost or gained.",
+    "",
+    "#Winning",
+    "The first player to bring their opponent to 0 HP wins the",
+    "match on the spot.",
+]
+
+
+# --- animated demo under the "Attacking" section: three units of two
+# random elements are selected (picker glow), transform, and march off ---
+
+RANIM_SEL0  = 0.7                  # first element selected
+RANIM_SEL1  = 1.5                  # second element selected
+RANIM_TF0   = 2.4                  # formation transforms
+RANIM_GO    = 3.0                  # balls start advancing
+RANIM_END   = 5.6                  # loop with fresh random elements
+RANIM_SPEED = 220                  # ball speed, px/s
+
+
+def new_rules_anim():
+    a, b = random.sample(range(NUM_COLORS), 2)
+    units = [a, b, random.choice((a, b))]   # both types always present
+    random.shuffle(units)
+    return {"types": (a, b), "units": units, "t": 0.0}
+
+
+def draw_rules_anim(surf, view, top, st):
+    t = st["t"]
+    uy = top + 8
+    xs = [view.x + 24 + i * (SPRITE_PX + 14) for i in range(3)]
+    sel_at = {st["types"][0]: RANIM_SEL0, st["types"][1]: RANIM_SEL1}
+
+    # selection glow under each unit of a picked element
+    p = (t / 0.9) % 1.0
+    for i, ci in enumerate(st["units"]):
+        s0 = sel_at[ci]
+        if t < s0:
+            continue
+        a = min(1.0, (t - s0) * 5.0)
+        if t > RANIM_TF0:                   # submit: glow fades back out
+            a -= (t - RANIM_TF0) * 3.0
+        if a > 0:
+            draw_ground_glow(surf, xs[i] - SPRITE_OFF, uy - SPRITE_OFF,
+                             CELL, a, p)
+
+    for i, ci in enumerate(st["units"]):
+        if t < RANIM_TF0:
+            blit_sprite(surf, SPRITES[ci]["idle"]["left"][idle_frame(t)],
+                        xs[i], uy)
+        elif t < RANIM_GO:
+            f = min(2, int((t - RANIM_TF0) / 0.2))
+            blit_sprite(surf, SPRITES[ci]["tf"]["left"][f], xs[i], uy)
+        else:
+            x = xs[i] + (t - RANIM_GO) * RANIM_SPEED
+            fade0, fade1 = view.right - 110, view.right - 30
+            if x >= fade1:
+                continue
+            alpha = 255 if x < fade0 else \
+                int(255 * (fade1 - x) / (fade1 - fade0))
+            bf = int(t / 0.12) % 4
+            blit_sprite(surf, SPRITES[ci]["ball"]["left"][bf],
+                        int(x), uy, alpha)
+
+
+# --- demo under "Moving the Front": four attackers vs four defenders on
+# real territory tiles. Alternates between a 3-formation stuck behind an
+# odd unit out (two border sacrifices, one kill) and a full 4-formation
+# (two kills); conquered tiles flip to the attacker's ground color ---
+
+MF_SEL0    = 0.7                   # first element selected
+MF_SEL1    = 1.4                   # second element selected
+MF_NF_FADE = 2.1                   # the odd unit out fades (non-formation)
+MF_TF0     = 2.6                   # formation transforms
+MF_GO      = 3.2                   # balls march
+MF_SPEED   = 140.0                 # slide speed, px/s
+MF_HOLD    = 0.8                   # beat on the result before fading
+MF_FADE_S  = 0.5                   # strip fade-out
+
+
+def new_mf_anim(case4=False):
+    a, b = random.sample(range(NUM_COLORS), 2)
+    n = 4 if case4 else 3
+    fmt = [a] + [random.choice((a, b)) for _ in range(n - 1)]
+    random.shuffle(fmt)                     # pure or mixed, both legal
+    front = random.choice([c for c in range(NUM_COLORS) if c not in (a, b)])
+    kills = n - 2
+    cross_px = (4 - (n - 1)) * CELL         # formation front -> the border
+    kill_px = [cross_px + 2 * CELL * (i + 1) for i in range(kills)]
+    fade0 = MF_GO + kill_px[-1] / MF_SPEED + DEATH_DUR + MF_HOLD
+    return {"case4": case4, "types": (a, b), "fmt": fmt, "front": front,
+            "defs": [random.randrange(NUM_COLORS) for _ in range(4)],
+            "bgv": [random.randrange(BG_VARIANTS) for _ in range(8)],
+            "cross_px": cross_px, "kill_px": kill_px,
+            "fade0": fade0, "end": fade0 + MF_FADE_S, "t": 0.0}
+
+
+def draw_mf_anim(surf, view, top, st):
+    t = st["t"]
+    n = len(st["fmt"])
+    kills = n - 2
+    x0 = view.x + (view.w - 8 * CELL) // 2
+    y = top + 2
+    slide = max(0.0, t - MF_GO) * MF_SPEED
+    sac_t = MF_GO + st["cross_px"] / MF_SPEED
+    kill_t = [MF_GO + px / MF_SPEED for px in st["kill_px"]]
+    scared_f = int(t / 0.12) % 2
+
+    # territory tiles; conquered ground flips to the attacker's color
+    for c in range(8):
+        side = "left" if c <= 3 else "right"
+        if c >= 4 and c - 4 < kills and t >= kill_t[c - 4]:
+            side = "left"
+        surf.blit(BG_TILES[side][st["bgv"][c]], (x0 + c * CELL, y))
+
+    # selection glow under formation units of each picked element
+    p = (t / 0.9) % 1.0
+    for i, ci in enumerate(st["fmt"]):
+        s0 = MF_SEL0 if ci == st["types"][0] else MF_SEL1
+        if t < s0:
+            continue
+        a = min(1.0, (t - s0) * 5.0)
+        if t > MF_TF0:                      # submit: glow fades back out
+            a -= (t - MF_TF0) * 3.0
+        if a > 0:
+            draw_ground_glow(surf, x0 + i * CELL, y, CELL, a, p)
+
+    # the odd unit out (3-formation case): fades like any non-formation
+    # attacker when combat starts
+    if n == 3:
+        alpha = 255 if t < MF_NF_FADE else \
+            max(0, int(255 * (1 - (t - MF_NF_FADE) / 0.5)))
+        if alpha > 0:
+            blit_sprite(surf, SPRITES[st["front"]]["idle"]["left"]
+                        [idle_frame(t)],
+                        x0 + 3 * CELL + SPRITE_OFF, y + SPRITE_OFF, alpha)
+
+    # defenders: idle -> panic as the killer closes in -> death burst
+    for j, dc in enumerate(st["defs"]):
+        cx = x0 + (4 + j) * CELL
+        doomed = j < kills
+        if doomed and t >= kill_t[j]:
+            if t < kill_t[j] + DEATH_DUR:
+                draw_death_burst(surf, dc, cx + CELL // 2, y + CELL // 2,
+                                 t - kill_t[j])
+            continue
+        if doomed and t >= MF_GO and slide >= st["kill_px"][j] - 1.5 * CELL:
+            blit_sprite(surf, SPRITES[dc]["scared"]["right"][scared_f],
+                        cx + SPRITE_OFF, y + SPRITE_OFF)
+        else:
+            blit_sprite(surf, SPRITES[dc]["idle"]["right"][idle_frame(t)],
+                        cx + SPRITE_OFF, y + SPRITE_OFF)
+
+    # the formation: idle -> transform -> marching balls, spent from the
+    # front (two at the border, then one per kill) exactly like a match
+    bf = int(t / 0.12) % 4
+    for i, ci in enumerate(st["fmt"]):
+        ux = x0 + i * CELL + SPRITE_OFF
+        if t < MF_TF0:
+            blit_sprite(surf, SPRITES[ci]["idle"]["left"][idle_frame(t)],
+                        ux, y + SPRITE_OFF)
+        elif t < MF_GO:
+            f = min(2, int((t - MF_TF0) / 0.2))
+            blit_sprite(surf, SPRITES[ci]["tf"]["left"][f], ux, y + SPRITE_OFF)
+        else:
+            if i >= n - 2:                  # border-crossing sacrifice
+                gone_at = sac_t
+            else:                           # trades itself for defender #ki
+                gone_at = kill_t[n - 3 - i]
+            if t < gone_at:
+                blit_sprite(surf, SPRITES[ci]["ball"]["left"][bf],
+                            int(x0 + i * CELL + slide) + SPRITE_OFF,
+                            y + SPRITE_OFF)
+            elif t < gone_at + DEATH_DUR:   # spent soldiers burst in place
+                dpx = (gone_at - MF_GO) * MF_SPEED
+                draw_death_burst(surf, ci,
+                                 int(x0 + i * CELL + dpx) + CELL // 2,
+                                 y + CELL // 2, t - gone_at)
+
+    # wrap up: hold the result, then fade the strip for the other case
+    if t >= st["fade0"]:
+        a = min(255, int(255 * (t - st["fade0"]) / MF_FADE_S))
+        ov = pygame.Surface((8 * CELL, CELL), pygame.SRCALPHA)
+        ov.fill((26, 20, 14, a))
+        surf.blit(ov, (x0, y))
+
+
+# --- demo under "Flanking": three rows with staggered frontiers. The
+# middle row's 4-formation makes two kills; the second kill flanks the
+# top row (defender territory at that column) but not the bottom row
+# (attacker territory blocks the cascade). The top-row defender left in
+# front of the hole retreats into it and cedes his old tile. ---
+
+FL_RETREAT_S = 0.5                 # the survivor's step backward
+
+
+def new_flank_anim():
+    a, b = random.sample(range(NUM_COLORS), 2)
+    others = [c for c in range(NUM_COLORS) if c not in (a, b)]
+    fmt = [a] + [random.choice((a, b)) for _ in range(3)]
+    random.shuffle(fmt)
+    cross_px = CELL                          # middle frontier is after col 3
+    kill_px = [cross_px + 2 * CELL, cross_px + 4 * CELL]
+    kill_t = [MF_GO + px / MF_SPEED for px in kill_px]
+    retreat0 = kill_t[1] + DEATH_DUR + 0.3
+    retreat1 = retreat0 + FL_RETREAT_S
+    fade0 = retreat1 + 0.9
+    return {"types": (a, b), "fmt": fmt,
+            "top_atk": [random.choice(others) for _ in range(3)],  # cols 0-2
+            "bot_atk": [random.choice(others) for _ in range(5)],  # cols 0-4
+            "top_def": [random.randrange(NUM_COLORS) for _ in range(5)],
+            "mid_def": [random.randrange(NUM_COLORS) for _ in range(4)],
+            "bot_def": [random.randrange(NUM_COLORS) for _ in range(3)],
+            "bgv": [[random.randrange(BG_VARIANTS) for _ in range(8)]
+                    for _ in range(3)],
+            "kill_px": kill_px, "kill_t": kill_t,
+            "sac_t": MF_GO + cross_px / MF_SPEED,
+            "retreat0": retreat0, "retreat1": retreat1,
+            "fade0": fade0, "end": fade0 + MF_FADE_S, "t": 0.0}
+
+
+def draw_flank_anim(surf, view, top, st):
+    t = st["t"]
+    x0 = view.x + (view.w - 8 * CELL) // 2
+    slide = max(0.0, t - MF_GO) * MF_SPEED
+    kill_t = st["kill_t"]
+    scared_f = int(t / 0.12) % 2
+    bf = int(t / 0.12) % 4
+
+    def ry(r):
+        return top + 2 + r * CELL
+
+    # territory tiles; frontiers per row: 2 / 3 / 4. Conquered ground:
+    # middle cols 4-5 flip at their kills, top col 3 when the retreat ends.
+    frontier = (2, 3, 4)
+    for r in range(3):
+        for c in range(8):
+            side = "left" if c <= frontier[r] else "right"
+            if r == 1 and c in (4, 5) and t >= kill_t[c - 4]:
+                side = "left"
+            if r == 0 and c == 3 and t >= st["retreat1"]:
+                side = "left"
+            surf.blit(BG_TILES[side][st["bgv"][r][c]],
+                      (x0 + c * CELL, ry(r)))
+
+    # selection glow under the middle-row formation
+    p = (t / 0.9) % 1.0
+    for i, ci in enumerate(st["fmt"]):
+        s0 = MF_SEL0 if ci == st["types"][0] else MF_SEL1
+        if t < s0:
+            continue
+        a = min(1.0, (t - s0) * 5.0)
+        if t > MF_TF0:
+            a -= (t - MF_TF0) * 3.0
+        if a > 0:
+            draw_ground_glow(surf, x0 + i * CELL, ry(1), CELL, a, p)
+
+    # top/bottom attackers: not in the picked elements, so they fade out
+    # for combat like any non-formation unit and return for the retreat
+    if t < MF_NF_FADE:
+        nf_alpha = 255
+    elif t < st["retreat0"]:
+        nf_alpha = max(0, int(255 * (1 - (t - MF_NF_FADE) / 0.5)))
+    else:
+        nf_alpha = min(255, int(255 * (t - st["retreat0"]) / 0.4))
+    for r, colors in ((0, st["top_atk"]), (2, st["bot_atk"])):
+        for i, ci in enumerate(colors):
+            blit_sprite(surf, SPRITES[ci]["idle"]["left"][idle_frame(t)],
+                        x0 + i * CELL + SPRITE_OFF, ry(r) + SPRITE_OFF,
+                        nf_alpha)
+
+    # middle-row formation: idle -> transform -> marching balls
+    for i, ci in enumerate(st["fmt"]):
+        ux = x0 + i * CELL + SPRITE_OFF
+        if t < MF_TF0:
+            blit_sprite(surf, SPRITES[ci]["idle"]["left"][idle_frame(t)],
+                        ux, ry(1) + SPRITE_OFF)
+        elif t < MF_GO:
+            f = min(2, int((t - MF_TF0) / 0.2))
+            blit_sprite(surf, SPRITES[ci]["tf"]["left"][f],
+                        ux, ry(1) + SPRITE_OFF)
+        else:
+            gone_at = st["sac_t"] if i >= 2 else kill_t[1 - i]
+            if t < gone_at:
+                blit_sprite(surf, SPRITES[ci]["ball"]["left"][bf],
+                            int(x0 + i * CELL + slide) + SPRITE_OFF,
+                            ry(1) + SPRITE_OFF)
+            elif t < gone_at + DEATH_DUR:   # spent soldiers burst in place
+                dpx = (gone_at - MF_GO) * MF_SPEED
+                draw_death_burst(surf, ci,
+                                 int(x0 + i * CELL + dpx) + CELL // 2,
+                                 ry(1) + CELL // 2, t - gone_at)
+
+    def draw_def(ci, col, r, doomed_at=None, scare_from=None):
+        cx, cy = x0 + col * CELL, ry(r)
+        if doomed_at is not None and t >= doomed_at:
+            if t < doomed_at + DEATH_DUR:
+                draw_death_burst(surf, ci, cx + CELL // 2, cy + CELL // 2,
+                                 t - doomed_at)
+            return
+        if scare_from is not None and t >= MF_GO and slide >= scare_from:
+            blit_sprite(surf, SPRITES[ci]["scared"]["right"][scared_f],
+                        cx + SPRITE_OFF, cy + SPRITE_OFF)
+        else:
+            blit_sprite(surf, SPRITES[ci]["idle"]["right"][idle_frame(t)],
+                        cx + SPRITE_OFF, cy + SPRITE_OFF)
+
+    # middle row defenders (cols 4-7): the first two die to the march
+    for j, ci in enumerate(st["mid_def"]):
+        draw_def(ci, 4 + j, 1,
+                 doomed_at=kill_t[j] if j < 2 else None,
+                 scare_from=st["kill_px"][j] - int(1.5 * CELL)
+                 if j < 2 else None)
+
+    # top row defenders (cols 3-7): col 4 is flanked by the second kill;
+    # col 3 then retreats backward into the hole
+    for j, ci in enumerate(st["top_def"]):
+        col = 3 + j
+        if col == 4:
+            draw_def(ci, col, 0, doomed_at=kill_t[1],
+                     scare_from=st["kill_px"][1] - int(1.5 * CELL))
+        elif col == 3:
+            rx = x0 + col * CELL
+            if t >= st["retreat0"]:
+                prog = min(1.0, (t - st["retreat0"]) / FL_RETREAT_S)
+                rx += int(prog * CELL)
+            blit_sprite(surf, SPRITES[ci]["idle"]["right"][idle_frame(t)],
+                        rx + SPRITE_OFF, ry(0) + SPRITE_OFF)
+        else:
+            draw_def(ci, col, 0)
+
+    # bottom row defenders (cols 5-7): the attacker unit at col 4 blocks
+    # the cascade, so nothing happens to them
+    for j, ci in enumerate(st["bot_def"]):
+        draw_def(ci, 5 + j, 2)
+
+    # wrap up: hold the result, then fade the strip and go again
+    if t >= st["fade0"]:
+        a = min(255, int(255 * (t - st["fade0"]) / MF_FADE_S))
+        ov = pygame.Surface((8 * CELL, 3 * CELL), pygame.SRCALPHA)
+        ov.fill((26, 20, 14, a))
+        surf.blit(ov, (x0, top + 2))
+
+
+# --- demo under "Troops Refresh": a board left with holes after combat.
+# Both armies advance toward the front to fill their gaps (the game's
+# slide-fill), then fresh reinforcements fade in at each side's back. ---
+
+RF_SLIDE0 = 1.2                            # armies start advancing
+RF_SLIDE1 = RF_SLIDE0 + DUR_SLIDE_FILL
+RF_SPAWN0 = RF_SLIDE1 + 0.25               # reinforcements fade in
+RF_SPAWN1 = RF_SPAWN0 + DUR_SPAWN
+RF_FADE0  = RF_SPAWN1 + 1.4
+RF_END    = RF_FADE0 + MF_FADE_S
+
+
+def new_refresh_anim():
+    rows = []
+    for _ in range(3):
+        f = random.randint(2, 4)
+        keep_l = sorted(random.sample(range(0, f + 1),
+                                      f + 1 - random.randint(1, 2)))
+        keep_r = sorted(random.sample(range(f + 1, 8),
+                                      7 - f - random.randint(1, 2)))
+        # survivors pack toward the frontier, in order
+        left  = [(c, f - len(keep_l) + 1 + i, random.randrange(NUM_COLORS))
+                 for i, c in enumerate(keep_l)]
+        right = [(c, f + 1 + i, random.randrange(NUM_COLORS))
+                 for i, c in enumerate(keep_r)]
+        rows.append({
+            "f": f, "left": left, "right": right,
+            "spawn_l": [(c, random.randrange(NUM_COLORS))
+                        for c in range(0, f - len(keep_l) + 1)],
+            "spawn_r": [(c, random.randrange(NUM_COLORS))
+                        for c in range(f + 1 + len(keep_r), 8)],
+            "bgv": [random.randrange(BG_VARIANTS) for _ in range(8)]})
+    return {"rows": rows, "t": 0.0, "end": RF_END}
+
+
+def draw_refresh_anim(surf, view, top, st):
+    t = st["t"]
+    x0 = view.x + (view.w - 8 * CELL) // 2
+    slide_p = max(0.0, min(1.0, (t - RF_SLIDE0) / DUR_SLIDE_FILL))
+    spawn_a = 0 if t < RF_SPAWN0 else \
+        min(255, int(255 * (t - RF_SPAWN0) / DUR_SPAWN))
+
+    for r, row in enumerate(st["rows"]):
+        y = top + 2 + r * CELL
+        for c in range(8):
+            side = "left" if c <= row["f"] else "right"
+            surf.blit(BG_TILES[side][row["bgv"][c]], (x0 + c * CELL, y))
+        for side, units in (("left", row["left"]), ("right", row["right"])):
+            for c0, c1, ci in units:
+                x = x0 + (c0 + (c1 - c0) * slide_p) * CELL
+                blit_sprite(surf, SPRITES[ci]["idle"][side][idle_frame(t)],
+                            int(x) + SPRITE_OFF, y + SPRITE_OFF)
+        if spawn_a > 0:                     # reinforcements at the back
+            for side, spawns in (("left", row["spawn_l"]),
+                                 ("right", row["spawn_r"])):
+                for c, ci in spawns:
+                    blit_sprite(surf,
+                                SPRITES[ci]["idle"][side][idle_frame(t)],
+                                x0 + c * CELL + SPRITE_OFF, y + SPRITE_OFF,
+                                spawn_a)
+
+    if t >= RF_FADE0:
+        a = min(255, int(255 * (t - RF_FADE0) / MF_FADE_S))
+        ov = pygame.Surface((8 * CELL, 3 * CELL), pygame.SRCALPHA)
+        ov.fill((26, 20, 14, a))
+        surf.blit(ov, (x0, top + 2))
+
+
+# --- demo under "Breakthrough": five rows. The middle row's 5-formation
+# faces a single defender: two sacrifices, one kill, and the TWO leftover
+# balls punch through the back line together (all of them die): red flash,
+# -1 HP, every defender panics. Then the defender pushes back — the reclaim
+# triangle (4 in the hit row, 3 in rows +-1, 2 in rows +-2) sweeps the
+# frontier back, overrunning attackers even in the emptied 4th row, while
+# the top row — already 3 tiles deep in defenders — is left untouched. ---
+
+BT_ROWS    = 5
+BT_BASE_F  = (4, 6, 6, 7, 6)       # frontier per row (row 2 = hit row)
+BT_FINAL_F = (4, 4, 3, 4, 5)       # after the 4/3/2 reclaim triangle
+BT_FLASH_S = 1.0                   # red flash decay
+BT_FONT    = [None]                # lazy "-1 HP" font
+
+
+def new_bt_anim():
+    a, b = random.sample(range(NUM_COLORS), 2)
+    others = [x for x in range(NUM_COLORS) if x not in (a, b)]
+    fmt = [a] + [random.choice((a, b)) for _ in range(4)]   # row 2, cols 2-6
+    random.shuffle(fmt)
+    nf, defs = {}, {}
+    for r in range(BT_ROWS):
+        for c in range(8):
+            if r == 2 and 2 <= c <= 6:
+                continue                    # the formation lives here
+            if c <= BT_BASE_F[r]:
+                nf[(r, c)] = random.choice(others)
+            else:
+                defs[(r, c)] = random.randrange(NUM_COLORS)
+    st = {"types": (a, b), "fmt": fmt, "nf": nf, "defs": defs,
+          "bgv": [[random.randrange(BG_VARIANTS) for _ in range(8)]
+                  for _ in range(BT_ROWS)],
+          "t": 0.0}
+    st["sac"]   = MF_GO + CELL / MF_SPEED
+    st["kill1"] = MF_GO + 3 * CELL / MF_SPEED
+    st["bt"]    = MF_GO + 5 * CELL / MF_SPEED     # the back line falls
+    st["clean"] = st["bt"] + 1.1                  # army fades back in
+    st["reclaim"] = st["bt"] + 1.9                # the push-back sweep
+    st["fade0"] = st["reclaim"] + DUR_RECLAIM + 1.3
+    st["end"] = st["fade0"] + MF_FADE_S
+    return st
+
+
+def draw_bt_anim(surf, view, top, st):
+    t = st["t"]
+    x0 = view.x + (view.w - 8 * CELL) // 2
+    slide = max(0.0, t - MF_GO) * MF_SPEED
+    scared_f = int(t / 0.12) % 2
+    cel_f = int(t / 0.14) % 2
+    bf = int(t / 0.12) % 4
+    flashing = st["bt"] <= t < st["bt"] + BT_FLASH_S
+    celebrating = st["clean"] <= t < st["reclaim"] + DUR_RECLAIM
+
+    def ry(r):
+        return top + 2 + r * CELL
+
+    def cur_f(r):
+        f = BT_BASE_F[r]
+        if r == 2 and t >= st["kill1"]:
+            f = 7
+        if t >= st["reclaim"]:              # the frontier sweeps back
+            p = min(1.0, (t - st["reclaim"]) / DUR_RECLAIM)
+            f = int(round(f + (BT_FINAL_F[r] - f) * p))
+        return f
+
+    for r in range(BT_ROWS):
+        f = cur_f(r)
+        for c in range(8):
+            side = "left" if c <= f else "right"
+            surf.blit(BG_TILES[side][st["bgv"][r][c]],
+                      (x0 + c * CELL, ry(r)))
+
+    # selection glow under the formation
+    p = (t / 0.9) % 1.0
+    for i, ci in enumerate(st["fmt"]):
+        s0 = MF_SEL0 if ci == st["types"][0] else MF_SEL1
+        if t < s0:
+            continue
+        a = min(1.0, (t - s0) * 5.0)
+        if t > MF_TF0:
+            a -= (t - MF_TF0) * 3.0
+        if a > 0:
+            draw_ground_glow(surf, x0 + (2 + i) * CELL, ry(2), CELL, a, p)
+
+    # defenders: the hit row's lone defender dies to the march; everyone
+    # panics under the breakthrough flash
+    for (r, c), ci in st["defs"].items():
+        cx, cy = x0 + c * CELL, ry(r)
+        doomed_at = st["kill1"] if (r, c) == (2, 7) else None
+        if doomed_at is not None and t >= doomed_at:
+            if t < doomed_at + DEATH_DUR:
+                draw_death_burst(surf, ci, cx + CELL // 2, cy + CELL // 2,
+                                 t - doomed_at)
+            continue
+        scare = flashing or (
+            doomed_at is not None and t >= MF_GO and
+            slide >= ((doomed_at - MF_GO) * MF_SPEED - 1.5 * CELL))
+        if scare:
+            blit_sprite(surf, SPRITES[ci]["scared"]["right"][scared_f],
+                        cx + SPRITE_OFF, cy + SPRITE_OFF)
+        else:
+            blit_sprite(surf, SPRITES[ci]["idle"]["right"][idle_frame(t)],
+                        cx + SPRITE_OFF, cy + SPRITE_OFF)
+
+    # non-formation attackers: fade for combat, return celebrating, and
+    # the ones standing on reclaimed ground are overrun
+    if t < MF_NF_FADE:
+        nf_alpha = 255
+    elif t < st["clean"]:
+        nf_alpha = max(0, int(255 * (1 - (t - MF_NF_FADE) / 0.5)))
+    else:
+        nf_alpha = min(255, int(255 * (t - st["clean"]) / 0.4))
+    for (r, c), ci in st["nf"].items():
+        overrun = c > BT_FINAL_F[r]
+        cx, cy = x0 + c * CELL, ry(r)
+        if overrun and t >= st["reclaim"]:
+            if t < st["reclaim"] + DEATH_DUR:
+                draw_death_burst(surf, ci, cx + CELL // 2, cy + CELL // 2,
+                                 t - st["reclaim"])
+            continue
+        if nf_alpha <= 0:
+            continue
+        if celebrating:
+            blit_sprite(surf, SPRITES[ci]["celebrate"]["left"][cel_f],
+                        cx + SPRITE_OFF, cy + SPRITE_OFF, nf_alpha)
+        else:
+            blit_sprite(surf, SPRITES[ci]["idle"]["left"][idle_frame(t)],
+                        cx + SPRITE_OFF, cy + SPRITE_OFF, nf_alpha)
+
+    # the formation: two sacrifices, one kill, and the two leftover
+    # balls punch through the back line together
+    gone = [st["bt"], st["bt"], st["kill1"], st["sac"], st["sac"]]
+    for i, ci in enumerate(st["fmt"]):
+        ux = x0 + (2 + i) * CELL
+        if t < MF_TF0:
+            blit_sprite(surf, SPRITES[ci]["idle"]["left"][idle_frame(t)],
+                        ux + SPRITE_OFF, ry(2) + SPRITE_OFF)
+        elif t < MF_GO:
+            f = min(2, int((t - MF_TF0) / 0.2))
+            blit_sprite(surf, SPRITES[ci]["tf"]["left"][f],
+                        ux + SPRITE_OFF, ry(2) + SPRITE_OFF)
+        elif t < gone[i]:
+            blit_sprite(surf, SPRITES[ci]["ball"]["left"][bf],
+                        int(ux + slide) + SPRITE_OFF, ry(2) + SPRITE_OFF)
+        elif t < gone[i] + DEATH_DUR:       # spent soldiers burst in place
+            dpx = (gone[i] - MF_GO) * MF_SPEED
+            draw_death_burst(surf, ci, int(ux + dpx) + CELL // 2,
+                             ry(2) + CELL // 2, t - gone[i])
+
+    # the breakthrough: red flash over the field and the HP toll
+    if flashing:
+        a = int(220 * (1 - (t - st["bt"]) / BT_FLASH_S))
+        ov = pygame.Surface((8 * CELL, BT_ROWS * CELL), pygame.SRCALPHA)
+        ov.fill((255, 30, 10, a))
+        surf.blit(ov, (x0, top + 2))
+        if BT_FONT[0] is None:
+            BT_FONT[0] = pygame.font.SysFont("segoeui", 22, bold=True)
+        hp = BT_FONT[0].render("-1 HP", True, (255, 235, 230))
+        rise = int((t - st["bt"]) * 26)
+        surf.blit(hp, (x0 + 8 * CELL - hp.get_width() - 10,
+                       ry(2) - 6 - rise))
+
+    if t >= st["fade0"]:
+        a = min(255, int(255 * (t - st["fade0"]) / MF_FADE_S))
+        ov = pygame.Surface((8 * CELL, BT_ROWS * CELL), pygame.SRCALPHA)
+        ov.fill((26, 20, 14, a))
+        surf.blit(ov, (x0, top + 2))
+
+
+# --- demo under "Defending": a vertical defense formation two columns from
+# the back blocks a 3-formation (top row) outright and stops a 4-formation
+# (bottom row) after one kill. The twice-hit wall keeps blocking all turn,
+# its casters slumping, then the whole formation dies with its territory
+# intact. Attack order and losses follow the real engine exactly. ---
+
+DF_ASEL0  = 0.7                    # attacker's first element
+DF_ASEL1  = 1.4                    # attacker's second element
+DF_DSEL   = 1.9                    # defender's picks glow
+DF_CAST   = 2.4                    # wall casters raise their staffs
+DF_FLD    = 2.75                   # the fields rise
+DF_TF1    = 3.0                    # top formation transforms
+DF_MARCH1 = 3.45                   # ...and marches
+DF_TF2    = 5.1                    # bottom formation transforms
+DF_MARCH2 = 5.55                   # ...and marches
+DF_CLEAN  = 8.15                   # the exhausted wall dies
+DF_FADE0  = 9.3
+DF_END    = 9.8
+
+
+def new_def_anim():
+    a, b = random.sample(range(NUM_COLORS), 2)      # attacker's elements
+    others = [x for x in range(NUM_COLORS) if x not in (a, b)]
+    c, d = random.sample(range(NUM_COLORS), 2)      # defender's elements
+    top_fmt = [a] + [random.choice((a, b)) for _ in range(2)]   # cols 2-4
+    bot_fmt = [a] + [random.choice((a, b)) for _ in range(3)]   # cols 0-3
+    random.shuffle(top_fmt); random.shuffle(bot_fmt)
+    st = {"a_types": (a, b), "d_types": (c, d),
+          "top_fmt": top_fmt, "bot_fmt": bot_fmt,
+          "top_nf": [random.choice(others) for _ in range(2)],  # cols 0-1
+          "mid_atk": [random.choice(others) for _ in range(4)], # cols 0-3
+          "dfmt": [random.choice((c, d)) for _ in range(3)],    # col 5, r0-2
+          "top_def": [random.randrange(NUM_COLORS) for _ in range(2)],
+          "mid_def": [random.randrange(NUM_COLORS) for _ in range(3)],
+          "bot_def": [random.randrange(NUM_COLORS) for _ in range(3)],
+          "bgv": [[random.randrange(BG_VARIANTS) for _ in range(8)]
+                  for _ in range(3)],
+          "t": 0.0, "end": DF_END}
+    # no accidental second defense formation: columns 6 and 7 span all
+    # three rows, so make sure neither is entirely within the picked pair
+    for col, idx in ((6, 0), (7, 1)):
+        cells = (st["top_def"][idx], st["mid_def"][idx + 1],
+                 st["bot_def"][idx + 1])
+        if all(x in (c, d) for x in cells):
+            st["top_def"][idx] = random.choice(others)
+    # march timings (slide at MF_SPEED; kills cost two cells of travel)
+    st["sac1"]   = DF_MARCH1 + CELL / MF_SPEED
+    st["block1"] = DF_MARCH1 + 3 * CELL / MF_SPEED
+    st["sac2"]   = DF_MARCH2 + CELL / MF_SPEED
+    st["kill"]   = DF_MARCH2 + 3 * CELL / MF_SPEED
+    st["block2"] = DF_MARCH2 + 5 * CELL / MF_SPEED
+    return st
+
+
+def draw_def_anim(surf, view, top, st):
+    t = st["t"]
+    x0 = view.x + (view.w - 8 * CELL) // 2
+    scared_f = int(t / 0.12) % 2
+    tired_f = int(t / 0.24) % 2
+    field_f = int(t / FIELD_FRAME_S) % 3
+    bf = int(t / 0.12) % 4
+
+    def ry(r):
+        return top + 2 + r * CELL
+
+    # territory: frontiers 4 / 3 / 3; only the bottom kill cedes a tile.
+    # The dead wall's column stays defender ground (territory retained).
+    frontier = (4, 3, 3)
+    for r in range(3):
+        for c in range(8):
+            side = "left" if c <= frontier[r] else "right"
+            if r == 2 and c == 4 and t >= st["kill"]:
+                side = "left"
+            surf.blit(BG_TILES[side][st["bgv"][r][c]],
+                      (x0 + c * CELL, ry(r)))
+
+    # attacker's selection glow on both formations, then the defender's
+    # on the wall column
+    p = (t / 0.9) % 1.0
+    fmt_cells = [(0, 2 + i, ci) for i, ci in enumerate(st["top_fmt"])] + \
+                [(2, i, ci) for i, ci in enumerate(st["bot_fmt"])]
+    for r, cc, ci in fmt_cells:
+        s0 = DF_ASEL0 if ci == st["a_types"][0] else DF_ASEL1
+        if t < s0:
+            continue
+        a = min(1.0, (t - s0) * 5.0)
+        if t > DF_DSEL:                     # attack locked in
+            a -= (t - DF_DSEL) * 3.0
+        if a > 0:
+            draw_ground_glow(surf, x0 + cc * CELL, ry(r), CELL, a, p)
+    if t >= DF_DSEL:
+        a = min(1.0, (t - DF_DSEL) * 5.0)
+        if t > DF_CAST:
+            a -= (t - DF_CAST) * 3.0
+        if a > 0:
+            for r in range(3):
+                draw_ground_glow(surf, x0 + 5 * CELL, ry(r), CELL, a, p)
+
+    # non-formation attackers fade out for combat, back in afterwards
+    if t < DF_CAST:
+        nf_alpha = 255
+    elif t < DF_CLEAN:
+        nf_alpha = max(0, int(255 * (1 - (t - DF_CAST) / 0.5)))
+    else:
+        nf_alpha = min(255, int(255 * (t - DF_CLEAN) / 0.4))
+    for r, colors in ((0, st["top_nf"]), (1, st["mid_atk"])):
+        for i, ci in enumerate(colors):
+            blit_sprite(surf, SPRITES[ci]["idle"]["left"][idle_frame(t)],
+                        x0 + i * CELL + SPRITE_OFF, ry(r) + SPRITE_OFF,
+                        nf_alpha)
+
+    # the two attack formations: wait -> transform -> march -> spent
+    def draw_fmt(row, col0, fmt, tf0, march0, gone):
+        slide = max(0.0, t - march0) * MF_SPEED
+        for i, ci in enumerate(fmt):
+            ux = x0 + (col0 + i) * CELL
+            if t < tf0:
+                blit_sprite(surf,
+                            SPRITES[ci]["idle"]["left"][idle_frame(t)],
+                            ux + SPRITE_OFF, ry(row) + SPRITE_OFF)
+            elif t < march0:
+                f = min(2, int((t - tf0) / 0.2))
+                blit_sprite(surf, SPRITES[ci]["tf"]["left"][f],
+                            ux + SPRITE_OFF, ry(row) + SPRITE_OFF)
+            elif t < gone[i]:
+                blit_sprite(surf, SPRITES[ci]["ball"]["left"][bf],
+                            int(ux + slide) + SPRITE_OFF,
+                            ry(row) + SPRITE_OFF)
+            elif t < gone[i] + DEATH_DUR:   # spent soldiers burst in place
+                dpx = (gone[i] - march0) * MF_SPEED
+                draw_death_burst(surf, ci, int(ux + dpx) + CELL // 2,
+                                 ry(row) + CELL // 2, t - gone[i])
+
+    # top: front two sacrificed, the survivor breaks on the wall
+    draw_fmt(0, 2, st["top_fmt"], DF_TF1, DF_MARCH1,
+             [st["block1"], st["sac1"], st["sac1"]])
+    # bottom: two sacrificed, one kill, the last breaks on the wall
+    draw_fmt(2, 0, st["bot_fmt"], DF_TF2, DF_MARCH2,
+             [st["block2"], st["kill"], st["sac2"], st["sac2"]])
+
+    def draw_def(ci, col, r, doomed_at=None, scared=False):
+        cx, cy = x0 + col * CELL, ry(r)
+        if doomed_at is not None and t >= doomed_at:
+            if t < doomed_at + DEATH_DUR:
+                draw_death_burst(surf, ci, cx + CELL // 2, cy + CELL // 2,
+                                 t - doomed_at)
+            return
+        if scared:
+            blit_sprite(surf, SPRITES[ci]["scared"]["right"][scared_f],
+                        cx + SPRITE_OFF, cy + SPRITE_OFF)
+        else:
+            blit_sprite(surf, SPRITES[ci]["idle"]["right"][idle_frame(t)],
+                        cx + SPRITE_OFF, cy + SPRITE_OFF)
+
+    # plain defenders (cols 6-7 everywhere, col 4 in the middle/bottom)
+    for i, ci in enumerate(st["top_def"]):
+        draw_def(ci, 6 + i, 0)
+    for i, ci in enumerate(st["mid_def"]):
+        draw_def(ci, (4, 6, 7)[i], 1)
+    bot_scare = st["kill"] - 1.5 * CELL / MF_SPEED
+    for i, ci in enumerate(st["bot_def"]):
+        col = (4, 6, 7)[i]
+        draw_def(ci, col, 2,
+                 doomed_at=st["kill"] if col == 4 else None,
+                 scared=(col == 4 and bot_scare <= t < st["kill"]))
+
+    # the wall: cast -> field up -> hit (slump + damaged field) -> dies
+    for r, ci in enumerate(st["dfmt"]):
+        cx, cy = x0 + 5 * CELL, ry(r)
+        if t >= DF_CLEAN:
+            if t < DF_CLEAN + DEATH_DUR:
+                draw_death_burst(surf, ci, cx + CELL // 2, cy + CELL // 2,
+                                 t - DF_CLEAN)
+            continue
+        if t < DF_CAST:
+            blit_sprite(surf, SPRITES[ci]["idle"]["right"][idle_frame(t)],
+                        cx + SPRITE_OFF, cy + SPRITE_OFF)
+            continue
+        if t < DF_FLD:
+            f = min(2, int((t - DF_CAST) / 0.15))
+            blit_sprite(surf, SPRITES[ci]["cast"]["right"][f],
+                        cx + SPRITE_OFF, cy + SPRITE_OFF)
+            continue
+        hit = t >= st["block1"]
+        if hit:                             # exhausted from the first block
+            blit_sprite(surf, SPRITES[ci]["tired"]["right"][tired_f],
+                        cx + SPRITE_OFF, cy + SPRITE_OFF)
+        else:
+            blit_sprite(surf, SPRITES[ci]["idle"]["right"][idle_frame(t)],
+                        cx + SPRITE_OFF, cy + SPRITE_OFF)
+        draw_field(surf, ci, "right", cx, cy, field_f, damaged=hit)
+
+    if t >= DF_FADE0:
+        a = min(255, int(255 * (t - DF_FADE0) / MF_FADE_S))
+        ov = pygame.Surface((8 * CELL, 3 * CELL), pygame.SRCALPHA)
+        ov.fill((26, 20, 14, a))
+        surf.blit(ov, (x0, top + 2))
+
+
+def _rules_geom():
+    box = pygame.Rect(0, 0, 620, 470)
+    box.center = (SCREEN_W // 2, SCREEN_H // 2)
+    view = pygame.Rect(box.x + 26, box.y + 54, box.w - 66, RULES_VIEW_H)
+    close = pygame.Rect(box.right - 40, box.y + 12, 28, 28)
+    return box, view, close
+
+
+def rules_max_scroll():
+    return max(0, len(RULES_TEXT) * RULES_LINE_H - RULES_VIEW_H)
+
+
+def draw_rules_popup(surf, fonts, scroll, anims=None):
+    font, bfont, _ = fonts
+    ov = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+    ov.fill((0, 0, 0, 150))
+    surf.blit(ov, (0, 0))
+    box, view, close = _rules_geom()
+    pygame.draw.rect(surf, (26, 20, 14), box, border_radius=10)
+    pygame.draw.rect(surf, (215, 192, 120), box, 2, border_radius=10)
+    hdr = bfont.render("RULES", True, (255, 216, 120))
+    surf.blit(hdr, (box.centerx - hdr.get_width() // 2, box.y + 16))
+    pygame.draw.rect(surf, (60, 46, 32), close, border_radius=6)
+    pygame.draw.rect(surf, (170, 150, 110), close, 1, border_radius=6)
+    x_s = bfont.render("X", True, (220, 200, 160))
+    surf.blit(x_s, (close.centerx - x_s.get_width() // 2,
+                    close.centery - x_s.get_height() // 2))
+
+    old_clip = surf.get_clip()
+    surf.set_clip(view)
+    for i, line in enumerate(RULES_TEXT):
+        y = view.y + i * RULES_LINE_H - scroll
+        if line.startswith("@"):            # animated demo strip
+            st = (anims or {}).get(line)
+            strip_h = {"@attack_anim": 4, "@front_anim": 4,
+                       "@flank_anim": 10, "@def_anim": 10,
+                       "@bt_anim": 16,
+                       "@refresh_anim": 10}[line]     # in text lines
+            if st and view.y - strip_h * RULES_LINE_H < y < view.bottom:
+                draw_fn = {"@attack_anim": draw_rules_anim,
+                           "@front_anim": draw_mf_anim,
+                           "@flank_anim": draw_flank_anim,
+                           "@def_anim": draw_def_anim,
+                           "@bt_anim": draw_bt_anim,
+                           "@refresh_anim": draw_refresh_anim}[line]
+                draw_fn(surf, view, y, st)
+            continue
+        if y < view.y - RULES_LINE_H or y > view.bottom:
+            continue
+        if line.startswith("#"):
+            s = bfont.render(line[1:], True, (222, 196, 120))
+        else:
+            s = font.render(line, True, (200, 195, 185))
+        surf.blit(s, (view.x, y))
+    surf.set_clip(old_clip)
+
+    # scrollbar
+    max_s = rules_max_scroll()
+    if max_s > 0:
+        track = pygame.Rect(view.right + 12, view.y, 6, view.h)
+        pygame.draw.rect(surf, (55, 46, 36), track, border_radius=3)
+        th = max(28, view.h * view.h // (len(RULES_TEXT) * RULES_LINE_H))
+        ty = view.y + (view.h - th) * scroll // max_s
+        pygame.draw.rect(surf, (180, 158, 110),
+                         (track.x, ty, 6, th), border_radius=3)
+
+    hint = font.render("Scroll with the arrow keys or mouse wheel  ·  "
+                       "ESC to close", True, (140, 132, 118))
+    surf.blit(hint, (box.centerx - hint.get_width() // 2, box.bottom - 38))
+
+
+# --- Settings popup ---------------------------------------------------------
+
+SETTINGS_ROWS = ("Max HP", "Music Volume", "SFX Volume")
+
+
+def _settings_geom():
+    box = pygame.Rect(0, 0, 470, 360)
+    box.center = (SCREEN_W // 2, SCREEN_H // 2)
+    rows = []
+    for i in range(len(SETTINGS_ROWS)):
+        y = box.y + 72 + i * 56
+        row   = pygame.Rect(box.x + 20, y - 8, box.w - 40, 44)
+        minus = pygame.Rect(box.right - 172, y, 28, 28)
+        plus  = pygame.Rect(box.right - 64, y, 28, 28)
+        rows.append((row, minus, plus))
+    back = pygame.Rect(0, 0, 120, 32)
+    back.centerx = box.centerx
+    back.y = box.bottom - 84
+    return box, rows, back
+
+
+def draw_settings_popup(surf, fonts, sel):
+    font, bfont, _ = fonts
+    ov = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+    ov.fill((0, 0, 0, 150))
+    surf.blit(ov, (0, 0))
+    box, rows, back = _settings_geom()
+    pygame.draw.rect(surf, (26, 20, 14), box, border_radius=10)
+    pygame.draw.rect(surf, (215, 192, 120), box, 2, border_radius=10)
+    hdr = bfont.render("SETTINGS", True, (255, 216, 120))
+    surf.blit(hdr, (box.centerx - hdr.get_width() // 2, box.y + 16))
+
+    values = (str(HP_MAX),
+              f"{round(MUSIC_VOLUME * 100)}%",
+              f"{round(SFX_MASTER * 100)}%")
+    for i, (row, minus, plus) in enumerate(rows):
+        if i == sel:
+            pygame.draw.rect(surf, (44, 36, 22), row, border_radius=6)
+            pygame.draw.rect(surf, (235, 205, 110), row, 1, border_radius=6)
+        lbl = bfont.render(SETTINGS_ROWS[i], True,
+                           (255, 228, 130) if i == sel else (185, 175, 155))
+        surf.blit(lbl, (row.x + 12, row.centery - lbl.get_height() // 2))
+        for r, sym in ((minus, "-"), (plus, "+")):
+            pygame.draw.rect(surf, (60, 46, 32), r, border_radius=6)
+            pygame.draw.rect(surf, (170, 150, 110), r, 1, border_radius=6)
+            s = bfont.render(sym, True, (220, 200, 160))
+            surf.blit(s, (r.centerx - s.get_width() // 2,
+                          r.centery - s.get_height() // 2))
+        val = bfont.render(values[i], True, (230, 222, 205))
+        vx = (minus.right + plus.x) // 2 - val.get_width() // 2
+        surf.blit(val, (vx, minus.centery - val.get_height() // 2))
+
+    back_sel = (sel == len(SETTINGS_ROWS))
+    pygame.draw.rect(surf, (44, 62, 52) if back_sel else (34, 46, 40),
+                     back, border_radius=6)
+    pygame.draw.rect(surf, (170, 255, 195) if back_sel else (110, 200, 140),
+                     back, 2 if back_sel else 1, border_radius=6)
+    bk = bfont.render("Back", True,
+                      (200, 255, 215) if back_sel else (150, 230, 170))
+    surf.blit(bk, (back.centerx - bk.get_width() // 2,
+                   back.centery - bk.get_height() // 2))
+    hint = font.render("Up/Down = select  ·  Left/Right = adjust  ·  "
+                       "ESC to close", True, (140, 132, 118))
+    surf.blit(hint, (box.centerx - hint.get_width() // 2, box.bottom - 38))
 
 
 # ---------------------------------------------------------------------------
@@ -2303,7 +3487,7 @@ def main():
                                       int(SCREEN_H * win_scale)),
                                      pygame.RESIZABLE)
     screen = pygame.Surface((SCREEN_W, SCREEN_H)).convert()
-    pygame.display.set_caption("Mage Grid — Sprite Edition")
+    pygame.display.set_caption("ManaFront")
     clock = pygame.time.Clock()
     load_sprites()
 
@@ -2322,16 +3506,29 @@ def main():
     atk_is_left  = True
     anim: Optional[AnimState] = None
 
-    name_step = 0
+    # name screen focus ring — one stop per ROW: 0 = P1 name+type,
+    # 1 = P2 name+type, 2 = BATTLE!, 3 = Tutorial, 4 = Back
+    name_focus = 0
+    N_FOCUS    = 5
     inputs    = [TextInput("Left player name:"), TextInput("Right player name:")]
     # per-player type (Human / Computer difficulty), cycled on the name
     # screen and locked in for the whole match
-    ptype     = [CPU_PLAYERS["left"], CPU_PLAYERS["right"]]
-    type_btns = [pygame.Rect(SCREEN_W // 2 + 190, 150 + i * 90 + 14, 170, 30)
-                 for i in range(2)]
+    ptype      = [CPU_PLAYERS["left"], CPU_PLAYERS["right"]]
+    name_rects = [pygame.Rect(SCREEN_W // 2 - 170, 150 + i * 90, 340, 58)
+                  for i in range(2)]
+    type_btns  = [pygame.Rect(SCREEN_W // 2 + 190, 150 + i * 90 + 14, 170, 30)
+                  for i in range(2)]
+    battle_btn = pygame.Rect(SCREEN_W // 2 - 100, 430, 200, 42)
+    nback_btn  = pygame.Rect(SCREEN_W // 2 - 60, 530, 120, 32)
 
-    def cycle_type(i):
-        ptype[i] = PLAYER_TYPES[(PLAYER_TYPES.index(ptype[i]) + 1)
+    def toggle_arrow_rects(i):
+        """The < > buttons shown above a focused Human/CPU toggle."""
+        b = type_btns[i]
+        return (pygame.Rect(b.centerx - 38, b.y - 28, 30, 22),
+                pygame.Rect(b.centerx + 8,  b.y - 28, 30, 22))
+
+    def cycle_type(i, d=1):
+        ptype[i] = PLAYER_TYPES[(PLAYER_TYPES.index(ptype[i]) + d)
                                 % len(PLAYER_TYPES)]
 
     picker     = ElementPicker(sx)
@@ -2345,10 +3542,24 @@ def main():
     ai_choice     = None      # elements the computer decided on this pick
     ai_timer      = 0.0
     tut           = None      # None | {"step": i} | {"free": True}
-    tut_btn       = pygame.Rect(SCREEN_W // 2 - 75, 430, 150, 34)
+    tut_btn       = pygame.Rect(SCREEN_W // 2 - 75, 482, 150, 34)
+    duel          = new_name_duel()   # ambient duel on the name screen
+    rules_anim    = new_rules_anim()  # attack demo in the Rules popup
+    mf_anim       = new_mf_anim()     # moving-the-front demo, same popup
+    fl_anim       = new_flank_anim()  # flanking demo, same popup
+    df_anim       = new_def_anim()    # defending demo, same popup
+    bt_anim       = new_bt_anim()     # breakthrough demo, same popup
+    rf_anim       = new_refresh_anim()  # troops-refresh demo, same popup
     music_on      = True
     cur_track     = None
     paused        = None      # None | "match" (quit to title) | "app" (quit game)
+    menu_idx      = 0         # highlighted title-menu entry
+    popup         = None      # None | "rules" | "settings" (title screen only)
+    rules_scroll  = 0
+    set_row       = 0         # highlighted settings row
+    menu_rects    = title_menu_rects()
+    stagnant      = 0         # consecutive attack turns with no formations
+    resh          = None      # active stalemate-reshuffle animation
     load_ai_weights()
     load_sfx()
 
@@ -2359,6 +3570,47 @@ def main():
             start_music_track(name, music_on)
 
     play_track("prelude")
+
+    def activate_menu(i):
+        """Run the chosen title-menu entry."""
+        nonlocal menu_idx, phase, name_focus, popup, rules_scroll, set_row
+        nonlocal paused, rules_anim, mf_anim, fl_anim, df_anim, bt_anim
+        nonlocal rf_anim
+        menu_idx = i
+        play_sfx("confirm")
+        label = TITLE_MENU[i]
+        if label == "New Game":
+            phase = "name_entry"
+            name_focus = 0
+            inputs[0].text = ""; inputs[1].text = ""
+        elif label == "Rules":
+            popup = "rules"; rules_scroll = 0
+            rules_anim = new_rules_anim()
+            mf_anim = new_mf_anim()
+            fl_anim = new_flank_anim()
+            df_anim = new_def_anim()
+            bt_anim = new_bt_anim()
+            rf_anim = new_refresh_anim()
+        elif label == "Settings":
+            popup = "settings"; set_row = 0
+        else:                               # Quit — same prompt as ESC
+            paused = "app"
+
+    def adjust_setting(row, d):
+        """Nudge a settings row by d steps; applies immediately."""
+        global HP_MAX, MUSIC_VOLUME, SFX_MASTER
+        if row == 0:
+            HP_MAX = max(1, min(10, HP_MAX + d))
+        elif row == 1:
+            MUSIC_VOLUME = max(0, min(10, round(MUSIC_VOLUME * 10) + d)) / 10.0
+            try:
+                pygame.mixer.music.set_volume(
+                    MUSIC_VOLUME if music_on else 0.0)
+            except pygame.error:
+                pass
+        else:
+            SFX_MASTER = max(0, min(10, round(SFX_MASTER * 10) + d)) / 10.0
+            play_sfx("select")              # preview the new level
 
     def do_submit():
         """Confirm the picker's two elements (Enter key or computer turn)."""
@@ -2384,6 +3636,40 @@ def main():
                 play_sfx("field")          # the walls rise
         ai_choice = None
         ai_timer = 0.0
+
+    def start_match():
+        """Lock in the name-screen choices and start the battle."""
+        nonlocal bs, phase, color_step, left_name, right_name
+        nonlocal gs, stagnant, resh, turn
+        CPU_PLAYERS["left"]  = ptype[0]
+        CPU_PLAYERS["right"] = ptype[1]
+
+        def _pname(i):
+            txt = inputs[i].text.strip()
+            if ptype[i]:
+                tag = ptype[i].title()
+                return (txt + f" ({tag} CPU)") if txt else f"CPU ({tag})"
+            return txt or ("Left" if i == 0 else "Right")
+        left_name  = _pname(0)
+        right_name = _pname(1)
+        turn = 1
+        # first defender gets the two-tile head start
+        bs = make_board(first_attacker_is_left=atk_is_left)
+        phase = "pick"; color_step = 0; picker.reset()
+        gs = {"phase": "pick"}
+        stagnant = 0; resh = None
+        play_track("battle")
+
+    def start_tutorial():
+        nonlocal tut, left_name, right_name, turn, stagnant, resh
+        tut = {"step": 0}
+        CPU_PLAYERS["left"] = None
+        CPU_PLAYERS["right"] = "medium"
+        left_name, right_name = "You", "Tutor (CPU)"
+        turn = 1
+        stagnant = 0; resh = None
+        load_tut_step(HP_MAX, 2)
+        play_track("battle")
 
     def load_tut_step(hp_l, hp_r):
         """Reset the board to the current lesson's fixed layout."""
@@ -2417,7 +3703,8 @@ def main():
                 pygame.quit(); sys.exit()
 
             # map window mouse coordinates back into the logical canvas
-            if ev.type == pygame.MOUSEBUTTONDOWN and view_scale > 0:
+            if ev.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEMOTION) \
+                    and view_scale > 0:
                 mx, my = ev.pos
                 lp = (int((mx - view_x) / view_scale),
                       int((my - view_y) / view_scale))
@@ -2449,56 +3736,143 @@ def main():
             # ESC: during a match, offer quit-to-title; on the title and
             # name screens, offer quitting the game entirely
             if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
-                if phase in ("pick", "anim"):
+                if phase == "title" and popup:
+                    popup = None            # close the open popup first
+                    continue
+                if phase in ("pick", "anim", "reshuffle"):
                     paused = "match"
                     continue
-                if phase in ("title", "name_entry"):
+                if phase == "name_entry":
+                    phase = "title"        # back to the title menu
+                    continue
+                if phase == "title":
                     paused = "app"
                     continue
 
             if phase == "title":
-                if ev.type == pygame.KEYDOWN and ev.key == pygame.K_RETURN:
-                    phase = "name_entry"
-                    name_step = 0
-                    inputs[0].text = ""; inputs[1].text = ""
+                if popup == "rules":
+                    if ev.type == pygame.KEYDOWN:
+                        if ev.key == pygame.K_UP:
+                            rules_scroll -= 44
+                        elif ev.key == pygame.K_DOWN:
+                            rules_scroll += 44
+                        elif ev.key == pygame.K_PAGEUP:
+                            rules_scroll -= RULES_VIEW_H
+                        elif ev.key == pygame.K_PAGEDOWN:
+                            rules_scroll += RULES_VIEW_H
+                        elif ev.key == pygame.K_RETURN:
+                            popup = None
+                    elif ev.type == pygame.MOUSEWHEEL:
+                        rules_scroll -= ev.y * 44
+                    elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                        _, _, close = _rules_geom()
+                        if close.collidepoint(ev.pos):
+                            popup = None
+                    rules_scroll = max(0, min(rules_max_scroll(),
+                                              rules_scroll))
+
+                elif popup == "settings":
+                    n_set = len(SETTINGS_ROWS) + 1      # rows + Back button
+                    if ev.type == pygame.KEYDOWN:
+                        if ev.key == pygame.K_UP:
+                            set_row = (set_row - 1) % n_set
+                            play_sfx("select")
+                        elif ev.key == pygame.K_DOWN:
+                            set_row = (set_row + 1) % n_set
+                            play_sfx("select")
+                        elif ev.key == pygame.K_LEFT and \
+                                set_row < len(SETTINGS_ROWS):
+                            adjust_setting(set_row, -1)
+                        elif ev.key == pygame.K_RIGHT and \
+                                set_row < len(SETTINGS_ROWS):
+                            adjust_setting(set_row, +1)
+                        elif ev.key == pygame.K_RETURN:
+                            popup = None
+                    elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                        _, srows, back = _settings_geom()
+                        if back.collidepoint(ev.pos):
+                            popup = None
+                        for i, (row, minus, plus) in enumerate(srows):
+                            if minus.collidepoint(ev.pos):
+                                set_row = i; adjust_setting(i, -1)
+                            elif plus.collidepoint(ev.pos):
+                                set_row = i; adjust_setting(i, +1)
+                            elif row.collidepoint(ev.pos):
+                                set_row = i
+
+                else:
+                    if ev.type == pygame.KEYDOWN:
+                        if ev.key == pygame.K_UP:
+                            menu_idx = (menu_idx - 1) % len(TITLE_MENU)
+                            play_sfx("select")
+                        elif ev.key == pygame.K_DOWN:
+                            menu_idx = (menu_idx + 1) % len(TITLE_MENU)
+                            play_sfx("select")
+                        elif ev.key == pygame.K_RETURN:
+                            activate_menu(menu_idx)
+                    elif ev.type == pygame.MOUSEMOTION:
+                        for i, r in enumerate(menu_rects):
+                            if r.collidepoint(ev.pos):
+                                menu_idx = i
+                    elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                        for i, r in enumerate(menu_rects):
+                            if r.collidepoint(ev.pos):
+                                activate_menu(i)
 
             elif phase == "name_entry":
-                if ev.type == pygame.MOUSEBUTTONDOWN:
-                    for i, rect in enumerate(type_btns):
-                        if rect.collidepoint(ev.pos):
-                            cycle_type(i)
-                    if tut_btn.collidepoint(ev.pos):
-                        tut = {"step": 0}
-                        CPU_PLAYERS["left"] = None
-                        CPU_PLAYERS["right"] = "medium"
-                        left_name, right_name = "You", "Tutor (CPU)"
-                        turn = 1
-                        load_tut_step(HP_MAX, 2)
-                        play_track("battle")
+                if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                    old_focus = name_focus
+                    for i in range(2):
+                        if old_focus == i:   # arrows visible for this row
+                            la, ra = toggle_arrow_rects(i)
+                            if la.collidepoint(ev.pos):
+                                cycle_type(i, -1); play_sfx("select")
+                            elif ra.collidepoint(ev.pos):
+                                cycle_type(i, +1); play_sfx("select")
+                        if name_rects[i].collidepoint(ev.pos):
+                            name_focus = i
+                        if type_btns[i].collidepoint(ev.pos):
+                            name_focus = i
+                            cycle_type(i); play_sfx("select")
+                    if battle_btn.collidepoint(ev.pos):
+                        name_focus = 2
+                        play_sfx("confirm")
+                        start_match()
+                    elif tut_btn.collidepoint(ev.pos):
+                        name_focus = 3
+                        play_sfx("confirm")
+                        start_tutorial()
+                    elif nback_btn.collidepoint(ev.pos):
+                        phase = "title"
                 if ev.type == pygame.KEYDOWN:
-                    if ev.key == pygame.K_TAB:
-                        cycle_type(name_step)
-                    elif inputs[name_step].handle(ev):
-                        name_step += 1
-                        if name_step >= 2:
-                            # lock in who is computer-controlled for the match
-                            CPU_PLAYERS["left"]  = ptype[0]
-                            CPU_PLAYERS["right"] = ptype[1]
-
-                            def _pname(i):
-                                txt = inputs[i].text.strip()
-                                if ptype[i]:
-                                    tag = ptype[i].title()
-                                    return (txt + f" ({tag} CPU)") if txt \
-                                        else f"CPU ({tag})"
-                                return txt or "Player"
-                            left_name  = _pname(0)
-                            right_name = _pname(1)
-                            # first defender gets the two-tile head start
-                            bs = make_board(first_attacker_is_left=atk_is_left)
-                            phase = "pick"; color_step = 0; picker.reset()
-                            gs = {"phase": "pick"}
-                            play_track("battle")
+                    move = 0
+                    if ev.key == pygame.K_DOWN:
+                        move = 1
+                    elif ev.key == pygame.K_UP:
+                        move = -1
+                    elif ev.key == pygame.K_TAB:
+                        move = -1 if (ev.mod & pygame.KMOD_SHIFT) else 1
+                    if move:
+                        name_focus = (name_focus + move) % N_FOCUS
+                        play_sfx("select")
+                    elif name_focus in (0, 1) and \
+                            ev.key in (pygame.K_LEFT, pygame.K_RIGHT):
+                        cycle_type(name_focus,
+                                   -1 if ev.key == pygame.K_LEFT else 1)
+                        play_sfx("select")
+                    elif ev.key == pygame.K_RETURN:
+                        if name_focus == 2:
+                            play_sfx("confirm")
+                            start_match()
+                        elif name_focus == 3:
+                            play_sfx("confirm")
+                            start_tutorial()
+                        elif name_focus == 4:
+                            phase = "title"
+                        else:               # Enter walks toward BATTLE!
+                            name_focus += 1
+                    elif name_focus in (0, 1):
+                        inputs[name_focus].handle(ev)
 
             elif phase == "pick":
                 picking_left = atk_is_left if color_step == 0 \
@@ -2529,7 +3903,31 @@ def main():
                     play_track("prelude")
 
         if phase == "name_entry":
-            inputs[name_step].update(dt)
+            for inp in inputs:
+                inp.update(dt)
+            duel["t"] += dt
+            if duel["t"] >= duel["end"]:   # next pair, roles swapped
+                duel = new_name_duel(not duel["atk_left"])
+
+        if phase == "title" and popup == "rules":
+            rules_anim["t"] += dt
+            if rules_anim["t"] >= RANIM_END:   # loop with fresh elements
+                rules_anim = new_rules_anim()
+            mf_anim["t"] += dt
+            if mf_anim["t"] >= mf_anim["end"]:  # alternate the two cases
+                mf_anim = new_mf_anim(not mf_anim["case4"])
+            fl_anim["t"] += dt
+            if fl_anim["t"] >= fl_anim["end"]:
+                fl_anim = new_flank_anim()
+            df_anim["t"] += dt
+            if df_anim["t"] >= df_anim["end"]:
+                df_anim = new_def_anim()
+            bt_anim["t"] += dt
+            if bt_anim["t"] >= bt_anim["end"]:
+                bt_anim = new_bt_anim()
+            rf_anim["t"] += dt
+            if rf_anim["t"] >= rf_anim["end"]:
+                rf_anim = new_refresh_anim()
 
         # computer player turn
         if phase == "pick":
@@ -2568,6 +3966,7 @@ def main():
             if anim.match_over_at is not None:
                 play_track("victory")
             if advance_anim(anim, dt):
+                had_attack  = bool(anim.plan.attack_formations)
                 bs          = anim.plan.final_board
                 turn       += 1
                 atk_is_left = not atk_is_left
@@ -2585,53 +3984,118 @@ def main():
                     else:
                         load_tut_step(bs.hp_left, bs.hp_right)
                 else:
-                    phase = "pick"; color_step = 0; picker.reset()
-                    atk_colors = None; def_colors = None
-                    gs = {"phase": "pick"}
+                    stagnant = 0 if had_attack else stagnant + 1
+                    if stagnant >= STALEMATE_TURNS:
+                        # nobody is making progress: recall both armies
+                        stagnant = 0
+                        resh = start_reshuffle(bs)
+                        phase = "reshuffle"; gs = {"phase": "reshuffle"}
+                        play_sfx("transform")
+                    else:
+                        phase = "pick"; color_step = 0; picker.reset()
+                        atk_colors = None; def_colors = None
+                        gs = {"phase": "pick"}
+
+        if phase == "reshuffle" and resh is not None:
+            prev_t = resh["t"]
+            resh["t"] += dt
+            if any(prev_t < te <= resh["t"]
+                   for te in resh["explode"].values()):
+                play_sfx("poof")
+            if resh["t"] >= RESH_DUR:
+                bs = resh["new_bs"]
+                resh = None
+                phase = "pick"; color_step = 0; picker.reset()
+                atk_colors = None; def_colors = None
+                gs = {"phase": "pick"}
 
         # Draw
         screen.fill((10, 8, 5))
 
         if phase == "title":
-            draw_title(screen, fonts, t)
+            draw_title(screen, fonts, t, menu_idx)
+            if popup == "rules":
+                draw_rules_popup(screen, fonts, rules_scroll,
+                                 {"@attack_anim": rules_anim,
+                                  "@front_anim": mf_anim,
+                                  "@flank_anim": fl_anim,
+                                  "@def_anim": df_anim,
+                                  "@bt_anim": bt_anim,
+                                  "@refresh_anim": rf_anim})
+            elif popup == "settings":
+                draw_settings_popup(screen, fonts, set_row)
 
         elif phase == "name_entry":
             screen.fill((18, 14, 10))
             hdr = bfont.render("Enter Player Names", True, (200, 178, 110))
             screen.blit(hdr, (SCREEN_W//2 - hdr.get_width()//2, 70))
+            draw_name_duel(screen, duel)
             for i, inp in enumerate(inputs):
+                focused = (name_focus == i)
                 inp.draw(screen, font, bfont,
-                         SCREEN_W//2 - 170, 150 + i*90,
-                         active=(i == name_step))
+                         SCREEN_W//2 - 170, 150 + i*90, active=focused)
+                if focused:
+                    pygame.draw.rect(screen, (235, 205, 110),
+                                     name_rects[i].inflate(12, 4), 1,
+                                     border_radius=6)
                 rect = type_btns[i]
+                tfoc = focused        # the whole row highlights together
                 is_cpu = ptype[i] is not None
                 pygame.draw.rect(screen, (34, 46, 62) if is_cpu else (36, 30, 22),
                                  rect, border_radius=6)
-                bc = (120, 190, 255) if is_cpu else (110, 100, 85)
+                bc = (235, 205, 110) if tfoc else \
+                    ((120, 190, 255) if is_cpu else (110, 100, 85))
                 pygame.draw.rect(screen, bc, rect,
-                                 2 if i == name_step else 1, border_radius=6)
+                                 2 if tfoc else 1, border_radius=6)
                 lbl = font.render(TYPE_LABELS[ptype[i]], True,
                                   (150, 205, 255) if is_cpu else (200, 195, 185))
                 screen.blit(lbl, (rect.x + (rect.w - lbl.get_width()) // 2,
                                   rect.y + (rect.h - lbl.get_height()) // 2))
-            hint = font.render(
-                "Click the button (or press Tab) to cycle Human / Computer "
-                "difficulty — locked in for the match", True, (130, 125, 115))
-            screen.blit(hint, (SCREEN_W//2 - hint.get_width()//2, 360))
+                if tfoc:
+                    # < > arrows above the focused toggle
+                    for r, d in zip(toggle_arrow_rects(i), (-1, 1)):
+                        pygame.draw.rect(screen, (60, 46, 32), r,
+                                         border_radius=5)
+                        pygame.draw.rect(screen, (235, 205, 110), r, 1,
+                                         border_radius=5)
+                        ax = r.centerx - d * 4
+                        pygame.draw.polygon(screen, (255, 228, 130),
+                                            [(ax, r.centery - 6),
+                                             (ax, r.centery + 6),
+                                             (ax + d * 8, r.centery)])
+            for r, label, foc, col in (
+                    (battle_btn, "BATTLE!", name_focus == 2,
+                     (255, 170, 60)),
+                    (tut_btn, "Tutorial", name_focus == 3,
+                     (150, 230, 170)),
+                    (nback_btn, "Back", name_focus == 4,
+                     (150, 230, 170))):
+                bg = (58, 40, 18) if r is battle_btn else (34, 46, 40)
+                if foc:
+                    bg = tuple(min(255, c + 22) for c in bg)
+                pygame.draw.rect(screen, bg, r, border_radius=6)
+                pygame.draw.rect(screen, (255, 228, 130) if foc else col,
+                                 r, 2 if foc else 1, border_radius=6)
+                s = bfont.render(label, True,
+                                 (255, 228, 130) if foc else col)
+                screen.blit(s, (r.centerx - s.get_width() // 2,
+                                r.centery - s.get_height() // 2))
+                if foc:
+                    for px, d in ((r.x - 16, 1), (r.right + 16, -1)):
+                        pygame.draw.polygon(screen, (255, 228, 130),
+                                            [(px, r.centery - 7),
+                                             (px, r.centery + 7),
+                                             (px + d * 10, r.centery)])
 
-            pygame.draw.rect(screen, (34, 46, 40), tut_btn, border_radius=6)
-            pygame.draw.rect(screen, (110, 200, 140), tut_btn, 1,
-                             border_radius=6)
-            tl = bfont.render("Tutorial", True, (150, 230, 170))
-            screen.blit(tl, (tut_btn.x + (tut_btn.w - tl.get_width()) // 2,
-                             tut_btn.y + (tut_btn.h - tl.get_height()) // 2))
-            tsub = font.render("New to the game? Learn it one turn at a time.",
-                               True, (110, 125, 112))
-            screen.blit(tsub, (SCREEN_W//2 - tsub.get_width()//2,
-                               tut_btn.bottom + 8))
-            esc_hint = font.render("ESC = quit", True, (120, 115, 105))
+            hint = font.render(
+                "Up/Down to move  ·  Left/Right to cycle "
+                "Human / Computer", True, (130, 125, 115))
+            screen.blit(hint, (SCREEN_W//2 - hint.get_width()//2,
+                               SCREEN_H - 62))
+            esc_hint = font.render("ESC = back to title", True,
+                                   (120, 115, 105))
             screen.blit(esc_hint, (SCREEN_W//2 - esc_hint.get_width()//2,
-                                   tut_btn.bottom + 34))
+                                   SCREEN_H - 36))
 
         elif phase == "pick":
             picking_left = atk_is_left if color_step == 0 else (not atk_is_left)
@@ -2678,6 +4142,13 @@ def main():
                 lines = TUTORIAL_FREE_LINES if tut.get("free") \
                     else TUTORIAL_STEPS[tut["step"]]["lines"]
                 draw_tut_panel(screen, fonts, lines)
+
+        elif phase == "reshuffle" and resh is not None:
+            draw_reshuffle(screen, resh, fonts, anim_t=t)
+            draw_hud(screen, fonts, atk_is_left, turn)
+            draw_player_bars(screen, fonts, left_name, right_name,
+                             bs.hp_left, bs.hp_right)
+            draw_sidebar(screen, fonts, sx, gs)
 
         elif phase == "gameover":
             # the winning army keeps celebrating behind the overlay
